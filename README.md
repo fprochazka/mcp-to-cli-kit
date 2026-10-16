@@ -30,6 +30,7 @@ Every tool of the server is then a subcommand, named in kebab case (`search_item
 ```console
 $ example-tool --help                      # the tools, from a one-hour cache
 $ example-tool search-items --help         # a tool's full description and options
+$ example-tool schema search-items         # the tool's raw input schema
 $ example-tool search-items --query "red" --limit 5 --tags a --tags b --no-verbose
 ```
 
@@ -101,6 +102,12 @@ Each property of a tool's input schema becomes an option:
 - Arguments are validated against the schema before the call. A usage error lists the tool's parameters, so no `--help` round trip is needed.
 
 A property named like a built-in option (`help`, `input-json`, `arg-file`, `json`, `pretty`) gets an `--arg-` prefix.
+
+### The schema command
+
+`schema TOOL` prints a tool's raw JSON input schema, as the server declared it in `tools/list`. It exists at every level where tools live (`example-tool schema search-items`, `example-tool beta schema search-items`, `example-tool svc-a schema list`) and accepts every name the tool's own command accepts. It reads the cached tool list, so with a warm cache nothing is sent to the server. The schema is printed as compact JSON in machine mode and indented otherwise.
+
+`schema` is a built-in command name: a tool whose command would be `schema` is renamed to `schema-tool`, and no group mount or tool group may be called `schema`.
 
 ### Output and exit codes
 

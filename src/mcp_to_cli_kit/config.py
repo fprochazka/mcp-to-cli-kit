@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,18 @@ ENV_NESTING = "__"
 SERVER_NAME_PATTERN = r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$"
 
 COMMAND_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
+
+# Commands the kit adds at every level where tools live; no group may take these names.
+BUILTIN_COMMANDS = frozenset({"schema"})
+
+
+def _not_builtin(name: str) -> str:
+    if name in BUILTIN_COMMANDS:
+        raise ValueError(f"{name!r} is a built-in command name")
+    return name
+
+
+CommandName = Annotated[str, Field(pattern=COMMAND_NAME_PATTERN), AfterValidator(_not_builtin)]
 
 
 class ConfigError(Exception):
@@ -73,7 +85,7 @@ class _StrictModel(BaseModel):
 class GroupMount(_StrictModel):
     """Mount a server's tools under a subcommand of the bin."""
 
-    group: Annotated[str, Field(pattern=COMMAND_NAME_PATTERN)]
+    group: CommandName
     help: str | None = None
 
 
@@ -93,7 +105,7 @@ class ToolGroup(_StrictModel):
     """
 
     prefix: Annotated[str, Field(min_length=1)]
-    group: Annotated[str, Field(pattern=COMMAND_NAME_PATTERN)]
+    group: CommandName
     help: str | None = None
 
 

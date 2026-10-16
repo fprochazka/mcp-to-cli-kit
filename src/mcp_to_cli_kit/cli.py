@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import difflib
 import inspect
+import json
 import logging
 import re
 import sys
@@ -38,6 +39,7 @@ from mcp_to_cli_kit.client import (
     distribution_version,
 )
 from mcp_to_cli_kit.config import (
+    BUILTIN_COMMANDS,
     CliConfig,
     ConfigError,
     GroupMount,
@@ -134,8 +136,13 @@ class ToolIndex:
     aliases: dict[str, str] = field(default_factory=dict)
 
     def add(self, server: str, local_name: str, tool: dict[str, Any], aliases: tuple[str, ...]) -> str | None:
-        """Add a tool under the kebab case of ``local_name``; returns the command name, None when it is taken."""
+        """Add a tool under the kebab case of ``local_name``; returns the command name, None when it is taken.
+
+        A tool whose command would be a built-in command (``schema``) gets a ``-tool`` suffix.
+        """
         command = kebab_case(local_name)
+        if command in BUILTIN_COMMANDS:
+            command = f"{command}-tool"
         if command in self.entries:
             command = local_name
         if command in self.entries:
@@ -705,7 +712,7 @@ class KitGroup(click.Group):
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         listing = self._listing(ctx)
-        return sorted([*listing.tools, *listing.groups])
+        return sorted([*listing.tools, *listing.groups, *BUILTIN_COMMANDS])
 
     def _listing(self, ctx: click.Context) -> TopLevelListing:
         runtime = _runtime(ctx)
@@ -716,6 +723,8 @@ class KitGroup(click.Group):
         return listing
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd_name == SchemaCommand.NAME:
+            return SchemaCommand()
         runtime = _runtime(ctx)
         groups = runtime.group_mounts()
         if cmd_name in groups:
@@ -744,6 +753,7 @@ class KitGroup(click.Group):
         if rows:
             with formatter.section("Tools"):
                 formatter.write_dl(rows)
+        _write_builtins(formatter)
         if listing.unavailable:
             with formatter.section("Unavailable servers"):
                 formatter.write_dl(sorted(listing.unavailable.items()))
@@ -759,9 +769,11 @@ class MountGroup(click.Group):
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         tools = _runtime(ctx).server_tools(self.server)
-        return sorted([*tools.entries, *tools.groups])
+        return sorted([*tools.entries, *tools.groups, *BUILTIN_COMMANDS])
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd_name == SchemaCommand.NAME:
+            return SchemaCommand()
         runtime = _runtime(ctx)
         for tool_group in runtime.config.servers[self.server].tool_groups:
             if tool_group.group == cmd_name:
@@ -785,6 +797,7 @@ class MountGroup(click.Group):
             with formatter.section("Groups"):
                 formatter.write_dl(sorted(groups))
         _write_tools(formatter, tools.entries)
+        _write_builtins(formatter)
 
 
 class ToolGroupCommand(click.Group):
@@ -798,9 +811,11 @@ class ToolGroupCommand(click.Group):
         self.tool_group = tool_group.group
 
     def list_commands(self, ctx: click.Context) -> list[str]:
-        return sorted(_runtime(ctx).server_tools(self.server).groups[self.tool_group].entries)
+        return sorted([*_runtime(ctx).server_tools(self.server).groups[self.tool_group].entries, *BUILTIN_COMMANDS])
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        if cmd_name == SchemaCommand.NAME:
+            return SchemaCommand()
         entry = _runtime(ctx).find_in_server(self.server, cmd_name, group=self.tool_group)
         return ToolCommand(entry) if entry is not None else None
 
@@ -811,6 +826,53 @@ class ToolGroupCommand(click.Group):
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         _write_tools(formatter, _runtime(ctx).server_tools(self.server).groups[self.tool_group].entries)
+        _write_builtins(formatter)
+
+
+class SchemaCommand(click.Command):
+    """``schema TOOL``: print a tool's input schema, resolved like the tool command itself.
+
+    The schema comes from the tool list, so with a warm cache nothing is sent. It is not server
+    text, so machine mode prints it as compact JSON and pretty mode indents it.
+    """
+
+    NAME = "schema"
+    HELP = "Print a tool's input schema as JSON."
+
+    def __init__(self) -> None:
+        super().__init__(
+            name=self.NAME,
+            help=f"{self.HELP} TOOL is any name the tool's own command accepts.",
+            params=[click.Argument(["tool"], metavar="TOOL"), *_mode_options()],
+        )
+
+    def invoke(self, ctx: click.Context) -> None:
+        parent = ctx.parent
+        assert parent is not None and isinstance(parent.command, click.Group)
+        group = parent.command
+        name = str(ctx.params["tool"])
+        target = group.get_command(parent, name) if name != self.NAME else None
+        if isinstance(target, click.Group):
+            raise click.UsageError(
+                f"{name!r} is a group, not a tool. Run '{parent.command_path} {name} schema TOOL'.", ctx
+            )
+        if not isinstance(target, ToolCommand):
+            tools = [command for command in group.list_commands(parent) if command != self.NAME]
+            close = difflib.get_close_matches(name, tools, n=3, cutoff=0.6)
+            hint = (
+                f" Did you mean {', '.join(close)}?" if close else f" Run '{parent.command_path} --help' for the list."
+            )
+            raise click.UsageError(f"No such tool {name!r}.{hint}", ctx)
+
+        schema = target.entry.tool.get("inputSchema") or {}
+        mode = resolve_mode(*_modes(ctx))
+        indent = 2 if mode == "pretty" else None
+        _write(json.dumps(schema, ensure_ascii=False, indent=indent) + "\n", "stdout")
+
+
+def _write_builtins(formatter: click.HelpFormatter) -> None:
+    with formatter.section("Commands"):
+        formatter.write_dl([(SchemaCommand.NAME, SchemaCommand.HELP)])
 
 
 def _write_tools(formatter: click.HelpFormatter, entries: Mapping[str, ToolEntry]) -> None:
