@@ -43,6 +43,7 @@ from mcp_to_cli_kit.config import (
     GroupMount,
     LoadedConfig,
     PrefixMount,
+    ToolGroup,
     default_config_path,
     load_config,
 )
@@ -126,36 +127,85 @@ class ToolEntry:
 
 
 @dataclass
-class ServerTools:
-    """The tool commands of one server, before any mount prefix."""
+class ToolIndex:
+    """Tool commands by command name, with the tool's own spellings as aliases."""
 
     entries: dict[str, ToolEntry] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
 
-    @classmethod
-    def build(cls, server: str, tools: list[dict[str, Any]], hidden: list[str]) -> ServerTools:
-        index = cls()
-        hidden_names = set(hidden)
-        for tool in tools:
-            name = tool.get("name")
-            if not isinstance(name, str) or not name or name in hidden_names:
-                continue
-            command = kebab_case(name)
-            if command in index.entries:
-                command = name
-            if command in index.entries:
-                logger.warning("Skipping the tool %r of %s: its command name is taken", name, server)
-                continue
-            index.entries[command] = ToolEntry(server, command, tool)
-            for alias in (name, name.replace("-", "_")):
-                index.aliases.setdefault(alias, command)
-        return index
+    def add(self, server: str, local_name: str, tool: dict[str, Any], aliases: tuple[str, ...]) -> str | None:
+        """Add a tool under the kebab case of ``local_name``; returns the command name, None when it is taken."""
+        command = kebab_case(local_name)
+        if command in self.entries:
+            command = local_name
+        if command in self.entries:
+            logger.warning("Skipping the tool %r of %s: its command name is taken", tool.get("name"), server)
+            return None
+        self.entries[command] = ToolEntry(server, command, tool)
+        for alias in (local_name, *aliases):
+            self.aliases.setdefault(alias, command)
+            self.aliases.setdefault(alias.replace("-", "_"), command)
+        return command
 
     def find(self, name: str) -> ToolEntry | None:
         if name in self.entries:
             return self.entries[name]
         alias = self.aliases.get(name) or self.aliases.get(name.replace("-", "_"))
         return self.entries.get(alias) if alias is not None else None
+
+
+@dataclass
+class ServerTools(ToolIndex):
+    """The tool commands of one server, before any mount prefix.
+
+    Tools whose names start with a ``tool_groups`` prefix live in that group, under their name
+    without the prefix; the rest stay here, at the server's mount level. The longest matching
+    prefix wins. A grouped tool's full name still finds it from the mount level, as an alias.
+    Hidden tools are left out before grouping, so they are in no group either.
+
+    Attributes:
+        groups: The tool groups by group name, each with its tools.
+        clashes: Names that are both an ungrouped tool command and a tool group.
+    """
+
+    groups: dict[str, ToolIndex] = field(default_factory=dict)
+    clashes: list[str] = field(default_factory=list)
+    grouped_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
+
+    @classmethod
+    def build(
+        cls, server: str, tools: list[dict[str, Any]], hidden: list[str], tool_groups: list[ToolGroup]
+    ) -> ServerTools:
+        index = cls(groups={group.group: ToolIndex() for group in tool_groups})
+        by_prefix = sorted(tool_groups, key=lambda group: len(group.prefix), reverse=True)
+        hidden_names = set(hidden)
+        for tool in tools:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name or name in hidden_names:
+                continue
+            group = next((g for g in by_prefix if name.startswith(g.prefix) and len(name) > len(g.prefix)), None)
+            if group is None:
+                index.add(server, name, tool, ())
+                continue
+            command = index.groups[group.group].add(server, name[len(group.prefix) :], tool, (name,))
+            if command is not None:
+                for alias in (name, name.replace("-", "_")):
+                    index.grouped_aliases.setdefault(alias, (group.group, command))
+        index.clashes = sorted(set(index.entries) & set(index.groups))
+        return index
+
+    def find(self, name: str) -> ToolEntry | None:
+        entry = super().find(name)
+        if entry is not None:
+            return entry
+        grouped = self.grouped_aliases.get(name) or self.grouped_aliases.get(name.replace("-", "_"))
+        if grouped is None:
+            return None
+        return self.groups[grouped[0]].entries.get(grouped[1])
+
+    def find_in_group(self, group: str, name: str) -> ToolEntry | None:
+        tools = self.groups.get(group)
+        return tools.find(name) if tools is not None else None
 
 
 @dataclass
@@ -231,17 +281,31 @@ class Runtime:
     def server_tools(self, server: str) -> ServerTools:
         """A server's tools by their command name within the server, without any mount prefix."""
         if server not in self._indexes:
-            self._indexes[server] = ServerTools.build(
-                server, self.tools(server), self.config.servers[server].hidden_tools
-            )
+            self._indexes[server] = self._index(server, self.tools(server))
         return self._indexes[server]
 
-    def find_in_server(self, server: str, name: str) -> ToolEntry | None:
-        """Find a tool of one server by command name, tool name or snake case.
+    def _index(self, server: str, tools: list[dict[str, Any]]) -> ServerTools:
+        config = self.config.servers[server]
+        index = ServerTools.build(server, tools, config.hidden_tools, config.tool_groups)
+        if index.clashes:
+            names = ", ".join(repr(name) for name in index.clashes)
+            raise ConfigFailure(
+                f"Server {server}: {names} is both a tool and a tool group. "
+                "Rename the tool group, or hide the tool with hidden_tools."
+            )
+        return index
+
+    def find_in_server(self, server: str, name: str, group: str | None = None) -> ToolEntry | None:
+        """Find a tool of one server, or of one of its tool groups, by command name, tool name or snake case.
 
         A miss in a cached list fetches the list once.
         """
-        entry = self.server_tools(server).find(name)
+
+        def lookup() -> ToolEntry | None:
+            tools = self.server_tools(server)
+            return tools.find(name) if group is None else tools.find_in_group(group, name)
+
+        entry = lookup()
         if entry is not None or server in self._live:
             return entry
         logger.debug("No command %r in the cached tool list of %s; fetching it again", name, server)
@@ -249,7 +313,18 @@ class Runtime:
         self._indexes.pop(server, None)
         cached = self.cache.load(server, self.clients[server].server.url)
         self._fetch(server, fallback=cached.tools if cached is not None else None)
-        return self.server_tools(server).find(name)
+        return lookup()
+
+    def top_level_tool_groups(self) -> dict[str, tuple[str, ToolGroup]]:
+        """The tool groups of root and prefix mounted servers, by top-level name. Known without a request.
+
+        A prefix mount puts its prefix in front of its tool groups too, as in front of its tools.
+        """
+        groups = {}
+        for server, prefix in self.top_level_servers():
+            for group in self.config.servers[server].tool_groups:
+                groups[prefix + group.group] = (server, group)
+        return groups
 
     @property
     def config(self) -> CliConfig:
@@ -287,7 +362,7 @@ class Runtime:
         cached = self.cache.load(server, self.clients[server].server.url)
         if cached is None or (fresh_only and not cached.fresh):
             return None
-        index = ServerTools.build(server, cached.tools, self.config.servers[server].hidden_tools)
+        index = self._index(server, cached.tools)
         if cached.fresh:
             self._tools[server] = cached.tools
             self._indexes[server] = index
@@ -357,6 +432,8 @@ class Runtime:
         Judged from what is known without a request: loaded lists and caches, even expired ones.
         """
         for other, prefix in self.candidates(group):
+            if other == server:
+                continue  # a server's own clashes are found when its list is indexed
             tools = self.offline_tools(other, fresh_only=False)
             if tools is not None and tools.find(group[len(prefix) :]) is not None:
                 raise _collision(group, [server, other])
@@ -375,6 +452,9 @@ class Runtime:
             assert isinstance(mount, GroupMount)
             owners[group] = server
             listing.groups[group] = mount.help or f"The tools of the {server} server."
+        for name, (server, tool_group) in self.top_level_tool_groups().items():
+            owners[name] = server
+            listing.groups[name] = _tool_group_help(server, tool_group)
         for server, prefix in self.top_level_servers():
             try:
                 tools = self.server_tools(server)
@@ -522,9 +602,6 @@ def _runtime(ctx: click.Context) -> Runtime:
         )
     except ConfigError as error:
         raise ConfigFailure(str(error)) from error
-    unsupported = _unsupported(loaded.config)
-    if unsupported:
-        raise ConfigFailure(unsupported)
     runtime = Runtime(group.app, loaded, refresh=bool(root.params.get("refresh_tools")))
     root.meta[_RUNTIME_KEY] = runtime
     root.call_on_close(runtime.close)
@@ -538,11 +615,8 @@ def _collision(name: str, servers: list[str]) -> ConfigFailure:
     )
 
 
-def _unsupported(config: CliConfig) -> str | None:
-    for name, server in config.servers.items():
-        if server.tool_groups:
-            return f"Server {name}: tool_groups are not supported yet."
-    return None
+def _tool_group_help(server: str, group: ToolGroup) -> str:
+    return group.help or f"The {server} tools whose names start with {group.prefix}."
 
 
 class KitGroup(click.Group):
@@ -648,6 +722,11 @@ class KitGroup(click.Group):
             # A group mount needs no request; the other servers are only checked from what is known.
             runtime.check_group_name(cmd_name, groups[cmd_name])
             return MountGroup(groups[cmd_name], cmd_name, runtime.config.servers[groups[cmd_name]].mount)
+        tool_groups = runtime.top_level_tool_groups()
+        if cmd_name in tool_groups:
+            server, tool_group = tool_groups[cmd_name]
+            runtime.check_group_name(cmd_name, server)
+            return ToolGroupCommand(server, tool_group, cmd_name)
         entry = runtime.resolve_top_level(cmd_name)
         return ToolCommand(entry) if entry is not None else None
 
@@ -679,10 +758,15 @@ class MountGroup(click.Group):
         self.server = server
 
     def list_commands(self, ctx: click.Context) -> list[str]:
-        return sorted(_runtime(ctx).server_tools(self.server).entries)
+        tools = _runtime(ctx).server_tools(self.server)
+        return sorted([*tools.entries, *tools.groups])
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
-        entry = _runtime(ctx).find_in_server(self.server, cmd_name)
+        runtime = _runtime(ctx)
+        for tool_group in runtime.config.servers[self.server].tool_groups:
+            if tool_group.group == cmd_name:
+                return ToolGroupCommand(self.server, tool_group, cmd_name)
+        entry = runtime.find_in_server(self.server, cmd_name)
         return ToolCommand(entry) if entry is not None else None
 
     def resolve_command(
@@ -691,11 +775,49 @@ class MountGroup(click.Group):
         return _resolve_with_hint(self, ctx, args, ctx.command_path)
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        entries = _runtime(ctx).server_tools(self.server).entries
-        rows = [(name, _first_line(entries[name].tool.get("description"))) for name in sorted(entries)]
-        if rows:
-            with formatter.section("Tools"):
-                formatter.write_dl(rows)
+        runtime = _runtime(ctx)
+        tools = runtime.server_tools(self.server)
+        groups = [
+            (group.group, _tool_group_help(self.server, group))
+            for group in runtime.config.servers[self.server].tool_groups
+        ]
+        if groups:
+            with formatter.section("Groups"):
+                formatter.write_dl(sorted(groups))
+        _write_tools(formatter, tools.entries)
+
+
+class ToolGroupCommand(click.Group):
+    """The tools of one server whose names start with a ``tool_groups`` prefix."""
+
+    def __init__(self, server: str, tool_group: ToolGroup, name: str) -> None:
+        super().__init__(
+            name=name, help=_tool_group_help(server, tool_group), params=_mode_options(), no_args_is_help=True
+        )
+        self.server = server
+        self.tool_group = tool_group.group
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        return sorted(_runtime(ctx).server_tools(self.server).groups[self.tool_group].entries)
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        entry = _runtime(ctx).find_in_server(self.server, cmd_name, group=self.tool_group)
+        return ToolCommand(entry) if entry is not None else None
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        return _resolve_with_hint(self, ctx, args, ctx.command_path)
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        _write_tools(formatter, _runtime(ctx).server_tools(self.server).groups[self.tool_group].entries)
+
+
+def _write_tools(formatter: click.HelpFormatter, entries: Mapping[str, ToolEntry]) -> None:
+    rows = [(name, _first_line(entries[name].tool.get("description"))) for name in sorted(entries)]
+    if rows:
+        with formatter.section("Tools"):
+            formatter.write_dl(rows)
 
 
 def _resolve_with_hint(

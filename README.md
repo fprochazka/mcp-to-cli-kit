@@ -67,6 +67,26 @@ Each server keeps its own session, cache file (`<cache>/<bin>/<server>.json`), h
 
 Two servers must not produce the same command name. When the tool lists show that they do (two root servers with a tool of the same name, or a group named like a top-level tool), the CLI stops with a config error that names both servers; give one of them a group or prefix mount, or hide the tool with `hidden_tools`. Calling a group checks the other servers only from what is already known (their caches), so a clash with a server whose tools were never fetched surfaces in the top-level `--help`. When a command resolves on one server while another server that could also define it cannot be reached, the CLI runs it and warns that the other server could not be checked.
 
+### Tool groups and hidden tools
+
+A server with many tools can split them into subcommands by tool-name prefix:
+
+```yaml
+servers:
+  example:
+    url: https://mcp.example.com/mcp
+    tool_groups:
+      - {prefix: svc_a_, group: svc-a, help: Service A.}   # svc_a_list -> example-tool svc-a list
+      - {prefix: svc_b_, group: svc-b}                     # svc_b_search -> example-tool svc-b search
+    hidden_tools: [svc_a_delete]
+```
+
+- The prefix is stripped from the command name inside the group. The tool's own name still works as an alias, inside the group (`svc-a svc_a_list`) and at the server's mount level (`example-tool svc_a_list`). The longest matching prefix wins.
+- Tools that match no prefix stay at the server's mount level.
+- Tool groups sit where the server is mounted: at the top level for a root mount, under the group for a group mount (`example-tool ex svc-a list`), and behind the prefix for a prefix mount, because the prefix applies to everything the server puts at the top level (`prefix: "b-"` gives `example-tool b-svc-a list`).
+- A tool group name must not clash with a tool command of the same server, with a group mount, or with another server's tool or tool group; each clash is a config error.
+- `hidden_tools` lists tools by their own names. A hidden tool is not listed and cannot be called, inside a tool group as well; a tool group stays listed even when all its tools are hidden.
+
 ### Options
 
 Each property of a tool's input schema becomes an option:

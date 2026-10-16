@@ -143,12 +143,16 @@ class CliConfig(_StrictModel):
         _reject_duplicates("mount group", groups)
         prefixes = [server.mount.prefix for server in self.servers.values() if isinstance(server.mount, PrefixMount)]
         _reject_duplicates("mount prefix", prefixes)
-        # Group mounts and the tool groups of root-mounted servers all become top-level subcommands.
-        root_tool_groups = [
-            group.group for server in self.servers.values() if server.mount == "root" for group in server.tool_groups
+        # Group mounts and the tool groups of root and prefix mounted servers (behind the prefix)
+        # all become top-level subcommands.
+        top_level_tool_groups = [
+            _top_level_prefix(server.mount) + group.group
+            for server in self.servers.values()
+            if not isinstance(server.mount, GroupMount)
+            for group in server.tool_groups
         ]
         _reject_duplicates(
-            "top-level command name", groups + root_tool_groups, explain="from group mounts and root tool_groups"
+            "top-level command name", groups + top_level_tool_groups, explain="from group mounts and tool_groups"
         )
         return self
 
@@ -438,6 +442,10 @@ def _parse_json(variable: str, value: str) -> Any:
         return json.loads(stripped)
     except json.JSONDecodeError as error:
         raise ConfigError(f"{variable} is not valid JSON: {error}") from error
+
+
+def _top_level_prefix(mount: Mount) -> str:
+    return mount.prefix if isinstance(mount, PrefixMount) else ""
 
 
 def _reject_duplicates(what: str, values: Iterable[str], explain: str | None = None) -> None:

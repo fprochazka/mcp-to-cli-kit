@@ -224,6 +224,21 @@ def build_server(json_response: bool) -> FastMCP:
         return '"slept"'
 
     @mcp.tool(structured_output=False)
+    def svc_a_list() -> str:
+        """List the service A items."""
+        return '["a1", "a2"]'
+
+    @mcp.tool(structured_output=False)
+    def svc_a_get(item_id: str) -> str:
+        """Get one service A item."""
+        return '{"id": "' + item_id + '"}'
+
+    @mcp.tool(structured_output=False)
+    def svc_b_search(query: str) -> str:
+        """Search service B."""
+        return '{"query": "' + query + '"}'
+
+    @mcp.tool(structured_output=False)
     def no_args() -> str:
         """Take nothing."""
         return '"done"'

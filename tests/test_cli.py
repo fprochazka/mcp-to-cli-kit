@@ -568,14 +568,6 @@ class TestConfigAndLogging:
 
         assert result.stderr == ""
 
-    def test_unsupported_tool_groups_are_reported(self, invoke: Invoke, json_server: RunningServer) -> None:
-        default = {"servers": {"example": {"url": json_server.url, "tool_groups": [{"prefix": "x_", "group": "x"}]}}}
-
-        result = invoke(["--help"], default=default)
-
-        assert result.exit_code == 2
-        assert "supported yet" in result.stderr
-
 
 class TestBrokenResponses:
     def config(self, server: RunningServer, read_timeout: float = 100) -> dict[str, object]:
