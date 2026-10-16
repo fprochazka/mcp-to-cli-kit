@@ -7,7 +7,10 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Filip Procházka" }]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pyyaml>=6.0",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -21,6 +24,7 @@ dev = [
   "mypy>=1.15",
   "pytest>=8.0",
   "ruff>=0.14",
+  "types-pyyaml>=6.0",
 ]
 
 [tool.ruff]
@@ -36,6 +40,12 @@ quote-style = "double"
 [tool.mypy]
 strict = true
 python_version = "3.11"
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
