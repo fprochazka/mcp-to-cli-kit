@@ -6,24 +6,87 @@ The kit owns the parts every such CLI needs and tends to get wrong when it is co
 
 The kit is under development and not published yet.
 
-## Usage
+## Building a consumer package
 
-A consumer package is a console script that hands the kit its bin name and a default configuration:
+A consumer is a small Python package with one console script. It names the bin, gives the default configuration, and hands both to the kit.
+
+`pyproject.toml`:
+
+```toml
+[project]
+name = "example-tool"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["mcp-to-cli-kit"]
+
+[project.scripts]
+example-tool = "example_tool.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/example_tool"]
+```
+
+`src/example_tool/cli.py`:
 
 ```python
+from typing import Any
+
 from mcp_to_cli_kit.cli import main as kit_main
 
-DEFAULT = {"servers": {"example": {"url": "https://mcp.example.com/mcp"}}}
+DEFAULT_CONFIG: dict[str, Any] = {
+    "help": "Call the tools of the example MCP server.",
+    "servers": {"example": {"url": "https://mcp.example.com/mcp"}},
+}
 
 
 def main() -> None:
-    kit_main("example-tool", DEFAULT)
+    kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool")
 ```
 
-```toml
-[project.scripts]
-example-tool = "example_tool:main"
+`DEFAULT_CONFIG` has the same shape as the config file (see [Configuration](#configuration)), so a user's `~/.config/example-tool/config.yaml` can override any key of it.
+
+`distribution` is the name of the consumer's own package. The kit reads its version from the package metadata and shows it in `--version`, in the `X-Mcp-Client: example-tool/<version> (mcp-to-cli-kit <version>)` header of every request, and in the `clientInfo` of the MCP `initialize` request. Without it, the kit looks for the package that installed the `example-tool` script, and falls back to `0.1.0`.
+
+### Results reported as text
+
+Some servers report a failure as an ordinary result instead of setting `isError`. A `result_classifier` turns such a result into an error: it is printed to stderr and the exit code is 1. The kit calls it only for results the server did not already mark as errors.
+
+```python
+from mcp import types
+from mcp_to_cli_kit.cli import main as kit_main
+
+
+def is_error(server: str, tool: str, result: types.CallToolResult) -> bool:
+    first = next((item.text for item in result.content if isinstance(item, types.TextContent)), "")
+    return first.startswith("Error: HTTP ")
+
+
+def main() -> None:
+    kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool", result_classifier=is_error)
 ```
+
+### Installing during development
+
+The kit is not on PyPI yet. Point the consumer at a local checkout of the kit as an editable path dependency, then install the consumer as a uv tool:
+
+```toml
+[tool.uv.sources]
+mcp-to-cli-kit = { path = "../mcp-to-cli-kit", editable = true }
+```
+
+```console
+$ uv tool install -e .
+$ example-tool --version
+example-tool 0.1.0 (mcp-to-cli-kit 0.1.0)
+```
+
+Because both installs are editable, a change in the kit or in the consumer takes effect without reinstalling.
+
+## Usage
 
 Every tool of the server is then a subcommand, named in kebab case (`search_items` becomes `search-items`; the tool's own name works too):
 
