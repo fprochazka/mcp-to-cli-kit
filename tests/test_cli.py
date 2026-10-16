@@ -568,8 +568,8 @@ class TestConfigAndLogging:
 
         assert result.stderr == ""
 
-    def test_unsupported_mount_is_reported(self, invoke: Invoke, json_server: RunningServer) -> None:
-        default = {"servers": {"example": {"url": json_server.url, "mount": {"group": "ex"}}}}
+    def test_unsupported_tool_groups_are_reported(self, invoke: Invoke, json_server: RunningServer) -> None:
+        default = {"servers": {"example": {"url": json_server.url, "tool_groups": [{"prefix": "x_", "group": "x"}]}}}
 
         result = invoke(["--help"], default=default)
 
@@ -704,7 +704,7 @@ class TestProcessBehaviour:
         def interrupted(self: object) -> None:
             raise raised()
 
-        monkeypatch.setattr(Runtime, "entries", interrupted)
+        monkeypatch.setattr(Runtime, "top_level_listing", interrupted)
 
         result = invoke(["--help"])
 

@@ -47,6 +47,26 @@ servers:
     sse_read_timeout: 100  # seconds to wait for an answer, streamed or not
 ```
 
+### Several servers in one bin
+
+A bin can serve several MCP servers. Each server says where its tools appear with `mount`:
+
+```yaml
+servers:
+  alpha:
+    url: https://alpha.example.com/mcp      # mount: root, the default: tools at the top level
+  beta:
+    url: https://beta.example.com/mcp
+    mount: {group: beta, help: The beta tools.}   # example-tool beta search-items ...
+  gamma:
+    url: https://gamma.example.com/mcp
+    mount: {prefix: "g-"}                    # example-tool g-search-items ...
+```
+
+Each server keeps its own session, cache file (`<cache>/<bin>/<server>.json`), headers and retries, and only the servers a command needs are contacted: `example-tool beta search-items` never talks to alpha. The top-level `--help` lists the groups without asking their servers, and lists the root and prefixed tools from the caches; a server that cannot be listed is shown under "Unavailable servers" while the others are still listed.
+
+Two servers must not produce the same command name. When the tool lists show that they do (two root servers with a tool of the same name, or a group named like a top-level tool), the CLI stops with a config error that names both servers; give one of them a group or prefix mount, or hide the tool with `hidden_tools`. Calling a group checks the other servers only from what is already known (their caches), so a clash with a server whose tools were never fetched surfaces in the top-level `--help`. When a command resolves on one server while another server that could also define it cannot be reached, the CLI runs it and warns that the other server could not be checked.
+
 ### Options
 
 Each property of a tool's input schema becomes an option:

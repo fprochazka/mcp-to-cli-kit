@@ -18,7 +18,7 @@ import logging
 import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -37,7 +37,15 @@ from mcp_to_cli_kit.client import (
     client_header_value,
     distribution_version,
 )
-from mcp_to_cli_kit.config import CliConfig, ConfigError, LoadedConfig, default_config_path, load_config
+from mcp_to_cli_kit.config import (
+    CliConfig,
+    ConfigError,
+    GroupMount,
+    LoadedConfig,
+    PrefixMount,
+    default_config_path,
+    load_config,
+)
 from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
 
 logger = logging.getLogger(__name__)
@@ -118,6 +126,48 @@ class ToolEntry:
 
 
 @dataclass
+class ServerTools:
+    """The tool commands of one server, before any mount prefix."""
+
+    entries: dict[str, ToolEntry] = field(default_factory=dict)
+    aliases: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def build(cls, server: str, tools: list[dict[str, Any]], hidden: list[str]) -> ServerTools:
+        index = cls()
+        hidden_names = set(hidden)
+        for tool in tools:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name or name in hidden_names:
+                continue
+            command = kebab_case(name)
+            if command in index.entries:
+                command = name
+            if command in index.entries:
+                logger.warning("Skipping the tool %r of %s: its command name is taken", name, server)
+                continue
+            index.entries[command] = ToolEntry(server, command, tool)
+            for alias in (name, name.replace("-", "_")):
+                index.aliases.setdefault(alias, command)
+        return index
+
+    def find(self, name: str) -> ToolEntry | None:
+        if name in self.entries:
+            return self.entries[name]
+        alias = self.aliases.get(name) or self.aliases.get(name.replace("-", "_"))
+        return self.entries.get(alias) if alias is not None else None
+
+
+@dataclass
+class TopLevelListing:
+    """What the bin's own help lists: the tools at the top level, the group mounts and the servers that failed."""
+
+    tools: dict[str, ToolEntry] = field(default_factory=dict)
+    groups: dict[str, str] = field(default_factory=dict)
+    unavailable: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class Runtime:
     """The state of one invocation: the config, the clients and the tool lists."""
 
@@ -129,8 +179,8 @@ class Runtime:
     cache: SchemaCache = field(init=False)
     _tools: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _live: set[str] = field(default_factory=set)
-    _entries: dict[str, ToolEntry] | None = None
-    _aliases: dict[str, str] = field(default_factory=dict)
+    _indexes: dict[str, ServerTools] = field(default_factory=dict)
+    _listing: TopLevelListing | None = None
 
     def __post_init__(self) -> None:
         self.cache = SchemaCache(default_cache_dir(self.app.bin_name))
@@ -166,9 +216,10 @@ class Runtime:
             tools = client.list_tools()
         except (TransportError, ServerRejectedError) as error:
             if fallback is None:
-                raise TransportFailure(f"cannot list the tools of {client.display_url}: {error}") from error
+                raise TransportFailure(f"cannot list the tools of {client.display_url} ({server}): {error}") from error
             click.echo(
-                f"{self.app.bin_name}: warning: cannot refresh the tool list ({error}); using the expired cached list.",
+                f"{self.app.bin_name}: warning: cannot refresh the tool list of {server} ({error}); "
+                "using the expired cached list.",
                 err=True,
             )
             self._tools[server] = fallback
@@ -177,54 +228,167 @@ class Runtime:
         self._tools[server] = tools
         return tools
 
-    def entries(self) -> dict[str, ToolEntry]:
-        """Every tool command, by command name."""
-        if self._entries is None:
-            self._entries = {}
-            self._aliases = {}
-            for server in self.loaded.config.servers:
-                self._add_entries(server)
-        return self._entries
+    def server_tools(self, server: str) -> ServerTools:
+        """A server's tools by their command name within the server, without any mount prefix."""
+        if server not in self._indexes:
+            self._indexes[server] = ServerTools.build(
+                server, self.tools(server), self.config.servers[server].hidden_tools
+            )
+        return self._indexes[server]
 
-    def _add_entries(self, server: str) -> None:
-        assert self._entries is not None
-        hidden = set(self.loaded.config.servers[server].hidden_tools)
-        for tool in self.tools(server):
-            name = tool.get("name")
-            if not isinstance(name, str) or not name or name in hidden:
-                continue
-            command = kebab_case(name)
-            if command in self._entries:
-                command = name
-            if command in self._entries:
-                logger.warning("Skipping the tool %r of %s: its command name is taken", name, server)
-                continue
-            self._entries[command] = ToolEntry(server, command, tool)
-            for alias in (name, name.replace("-", "_")):
-                self._aliases.setdefault(alias, command)
+    def find_in_server(self, server: str, name: str) -> ToolEntry | None:
+        """Find a tool of one server by command name, tool name or snake case.
 
-    def find(self, name: str) -> ToolEntry | None:
-        """Find a tool by its command name, its own name or its snake case. A miss refreshes a cached list once."""
-        entry = self._lookup(name)
-        if entry is not None:
+        A miss in a cached list fetches the list once.
+        """
+        entry = self.server_tools(server).find(name)
+        if entry is not None or server in self._live:
             return entry
-        stale = [server for server in self.loaded.config.servers if server not in self._live]
-        if not stale:
-            return None
-        logger.debug("No command %r in the cached tool lists; fetching them again", name)
-        for server in stale:
-            self._tools.pop(server, None)
-            cached = self.cache.load(server, self.clients[server].server.url)
-            self._fetch(server, fallback=cached.tools if cached is not None else None)
-        self._entries = None
-        return self._lookup(name)
+        logger.debug("No command %r in the cached tool list of %s; fetching it again", name, server)
+        self._tools.pop(server, None)
+        self._indexes.pop(server, None)
+        cached = self.cache.load(server, self.clients[server].server.url)
+        self._fetch(server, fallback=cached.tools if cached is not None else None)
+        return self.server_tools(server).find(name)
 
-    def _lookup(self, name: str) -> ToolEntry | None:
-        entries = self.entries()
-        if name in entries:
-            return entries[name]
-        alias = self._aliases.get(name) or self._aliases.get(name.replace("-", "_"))
-        return entries.get(alias) if alias is not None else None
+    @property
+    def config(self) -> CliConfig:
+        return self.loaded.config
+
+    def group_mounts(self) -> dict[str, str]:
+        """The servers mounted as a subcommand group, by group name. Known without any request."""
+        return {
+            server.mount.group: name
+            for name, server in self.config.servers.items()
+            if isinstance(server.mount, GroupMount)
+        }
+
+    def top_level_servers(self) -> list[tuple[str, str]]:
+        """The servers whose tools are top-level commands, with their command prefix ("" for the root mount)."""
+        mounted = []
+        for name, server in self.config.servers.items():
+            if server.mount == "root":
+                mounted.append((name, ""))
+            elif isinstance(server.mount, PrefixMount):
+                mounted.append((name, server.mount.prefix))
+        return mounted
+
+    def offline_tools(self, server: str, *, fresh_only: bool) -> ServerTools | None:
+        """A server's tools without any request: the list already loaded, else its cache, else None.
+
+        With ``fresh_only`` an expired cache, or any cache under ``--refresh-tools``, counts as missing.
+        """
+        if server in self._indexes:
+            return self._indexes[server]
+        if server in self._tools:
+            return self.server_tools(server)
+        if fresh_only and self.refresh:
+            return None
+        cached = self.cache.load(server, self.clients[server].server.url)
+        if cached is None or (fresh_only and not cached.fresh):
+            return None
+        index = ServerTools.build(server, cached.tools, self.config.servers[server].hidden_tools)
+        if cached.fresh:
+            self._tools[server] = cached.tools
+            self._indexes[server] = index
+        return index
+
+    def candidates(self, name: str) -> list[tuple[str, str]]:
+        """The top-level servers that could define a command name, with their prefixes."""
+        return [
+            (server, prefix)
+            for server, prefix in self.top_level_servers()
+            if name.startswith(prefix) and name != prefix
+        ]
+
+    def resolve_top_level(self, name: str) -> ToolEntry | None:
+        """Find a top-level tool command, asking only the servers that could define that name.
+
+        The first pass uses the lists already loaded or freshly cached and sends nothing. The
+        servers are asked only when that is not conclusive: those whose list is stale or missing
+        when one server has the name, and every candidate when nobody has it.
+
+        Raises:
+            ConfigFailure: Two servers define the same command name.
+            TransportFailure: The name was not found, and a server that might define it is unreachable.
+        """
+        candidates = self.candidates(name)
+        found: dict[str, ToolEntry] = {}
+        unknown: list[tuple[str, str]] = []
+        for server, prefix in candidates:
+            tools = self.offline_tools(server, fresh_only=True)
+            if tools is None:
+                unknown.append((server, prefix))
+                continue
+            entry = tools.find(name[len(prefix) :])
+            if entry is not None:
+                found[server] = replace(entry, command=prefix + entry.command)
+
+        to_ask = unknown if found else candidates
+        unchecked: list[tuple[str, TransportFailure]] = []
+        for server, prefix in to_ask:
+            if server in found:
+                continue
+            try:
+                entry = self.find_in_server(server, name[len(prefix) :])
+            except TransportFailure as error:
+                unchecked.append((server, error))
+                continue
+            if entry is not None:
+                found[server] = replace(entry, command=prefix + entry.command)
+
+        if len(found) > 1:
+            raise _collision(name, [server for server in self.config.servers if server in found])
+        if found:
+            for server, failure in unchecked:
+                click.echo(
+                    f"{self.app.bin_name}: warning: could not check server {server} for a conflicting tool "
+                    f"({failure.format_message()})",
+                    err=True,
+                )
+            return next(iter(found.values()))
+        if unchecked:
+            raise TransportFailure("\n".join(failure.format_message() for _, failure in unchecked))
+        return None
+
+    def check_group_name(self, group: str, server: str) -> None:
+        """Fail when a top-level tool has the same name as a group mount.
+
+        Judged from what is known without a request: loaded lists and caches, even expired ones.
+        """
+        for other, prefix in self.candidates(group):
+            tools = self.offline_tools(other, fresh_only=False)
+            if tools is not None and tools.find(group[len(prefix) :]) is not None:
+                raise _collision(group, [server, other])
+
+    def top_level_listing(self) -> TopLevelListing:
+        """Every top-level command, from the caches where possible.
+
+        A server that cannot be listed is reported in the listing, not raised.
+        """
+        if self._listing is not None:
+            return self._listing
+        listing = TopLevelListing()
+        owners: dict[str, str] = {}
+        for group, server in self.group_mounts().items():
+            mount = self.config.servers[server].mount
+            assert isinstance(mount, GroupMount)
+            owners[group] = server
+            listing.groups[group] = mount.help or f"The tools of the {server} server."
+        for server, prefix in self.top_level_servers():
+            try:
+                tools = self.server_tools(server)
+            except TransportFailure as error:
+                listing.unavailable[server] = error.format_message()
+                continue
+            for command, entry in tools.entries.items():
+                full = prefix + command
+                if full in owners:
+                    raise _collision(full, [owners[full], server])
+                owners[full] = server
+                listing.tools[full] = replace(entry, command=full)
+        self._listing = listing
+        return listing
 
     def forget_tools(self, server: str) -> None:
         """Drop a server's cache after it said a tool does not exist."""
@@ -335,6 +499,16 @@ def _mode(ctx: click.Context) -> OutputMode | None:
     return "machine" if machine else "pretty" if pretty else None
 
 
+def _modes(ctx: click.Context) -> list[OutputMode | None]:
+    """The output-mode flags from the tool's own options outwards, the innermost first."""
+    modes = []
+    current: click.Context | None = ctx
+    while current is not None:
+        modes.append(_mode(current))
+        current = current.parent
+    return modes
+
+
 def _runtime(ctx: click.Context) -> Runtime:
     root = ctx.find_root()
     runtime = root.meta.get(_RUNTIME_KEY)
@@ -357,12 +531,15 @@ def _runtime(ctx: click.Context) -> Runtime:
     return runtime
 
 
+def _collision(name: str, servers: list[str]) -> ConfigFailure:
+    return ConfigFailure(
+        f"The command {name!r} is defined by more than one server: {', '.join(servers)}. "
+        "Give one of them a group or prefix mount, or hide the tool with hidden_tools."
+    )
+
+
 def _unsupported(config: CliConfig) -> str | None:
-    if len(config.servers) > 1:
-        return "Several servers in one bin are not supported yet."
     for name, server in config.servers.items():
-        if server.mount != "root":
-            return f"Server {name}: only the root mount is supported yet."
         if server.tool_groups:
             return f"Server {name}: tool_groups are not supported yet."
     return None
@@ -390,7 +567,7 @@ class KitGroup(click.Group):
                 ["--refresh-tools", "refresh_tools"],
                 is_flag=True,
                 is_eager=True,
-                help="Fetch the tool list from the server instead of the cache (kept for an hour).",
+                help="Fetch the tool lists of the servers the command uses, ignoring the cache (kept for an hour).",
             ),
             *_mode_options(),
             click.Option(
@@ -444,39 +621,93 @@ class KitGroup(click.Group):
         return option
 
     def format_help_text(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        configured = _runtime(ctx).loaded.config.help
-        self.help = configured or (
-            "Call the tools of an MCP server. Each tool is a subcommand; "
+        config = _runtime(ctx).config
+        servers = "an MCP server" if len(config.servers) == 1 else "several MCP servers"
+        self.help = config.help or (
+            f"Call the tools of {servers}. Each tool is a subcommand; "
             f"run '{self.app.bin_name} TOOL --help' for its options."
         )
         super().format_help_text(ctx, formatter)
 
     def list_commands(self, ctx: click.Context) -> list[str]:
-        return sorted(_runtime(ctx).entries())
+        listing = self._listing(ctx)
+        return sorted([*listing.tools, *listing.groups])
+
+    def _listing(self, ctx: click.Context) -> TopLevelListing:
+        runtime = _runtime(ctx)
+        listing = runtime.top_level_listing()
+        if listing.unavailable and not listing.tools and not listing.groups:
+            # Nothing at all to show: the failures are the answer, as an error.
+            raise TransportFailure("\n".join(listing.unavailable.values()))
+        return listing
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
-        entry = _runtime(ctx).find(cmd_name)
-        if entry is None:
-            return None
-        return ToolCommand(entry)
+        runtime = _runtime(ctx)
+        groups = runtime.group_mounts()
+        if cmd_name in groups:
+            # A group mount needs no request; the other servers are only checked from what is known.
+            runtime.check_group_name(cmd_name, groups[cmd_name])
+            return MountGroup(groups[cmd_name], cmd_name, runtime.config.servers[groups[cmd_name]].mount)
+        entry = runtime.resolve_top_level(cmd_name)
+        return ToolCommand(entry) if entry is not None else None
 
     def resolve_command(
         self, ctx: click.Context, args: list[str]
     ) -> tuple[str | None, click.Command | None, list[str]]:
-        name = click.utils.make_str(args[0])
-        command = self.get_command(ctx, name)
-        if command is None and not ctx.resilient_parsing:
-            close = difflib.get_close_matches(name, self.list_commands(ctx), n=3, cutoff=0.6)
-            hint = f" Did you mean {', '.join(close)}?" if close else f" Run '{self.app.bin_name} --help' for the list."
-            ctx.fail(f"No such command {name!r}.{hint}")
-        return command.name if command is not None else None, command, args[1:]
+        return _resolve_with_hint(self, ctx, args, self.app.bin_name)
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
-        entries = _runtime(ctx).entries()
+        listing = self._listing(ctx)
+        if listing.groups:
+            with formatter.section("Groups"):
+                formatter.write_dl(sorted(listing.groups.items()))
+        rows = [(name, _first_line(entry.tool.get("description"))) for name, entry in sorted(listing.tools.items())]
+        if rows:
+            with formatter.section("Tools"):
+                formatter.write_dl(rows)
+        if listing.unavailable:
+            with formatter.section("Unavailable servers"):
+                formatter.write_dl(sorted(listing.unavailable.items()))
+
+
+class MountGroup(click.Group):
+    """The subcommand under which a group-mounted server's tools live. Only that server is contacted."""
+
+    def __init__(self, server: str, name: str, mount: Any) -> None:
+        help_text = getattr(mount, "help", None) or f"The tools of the {server} server."
+        super().__init__(name=name, help=help_text, params=_mode_options(), no_args_is_help=True)
+        self.server = server
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        return sorted(_runtime(ctx).server_tools(self.server).entries)
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        entry = _runtime(ctx).find_in_server(self.server, cmd_name)
+        return ToolCommand(entry) if entry is not None else None
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        return _resolve_with_hint(self, ctx, args, ctx.command_path)
+
+    def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        entries = _runtime(ctx).server_tools(self.server).entries
         rows = [(name, _first_line(entries[name].tool.get("description"))) for name in sorted(entries)]
         if rows:
             with formatter.section("Tools"):
                 formatter.write_dl(rows)
+
+
+def _resolve_with_hint(
+    group: click.Group, ctx: click.Context, args: list[str], help_path: str
+) -> tuple[str | None, click.Command | None, list[str]]:
+    name = click.utils.make_str(args[0])
+    command = group.get_command(ctx, name)
+    if command is None and not ctx.resilient_parsing:
+        close = difflib.get_close_matches(name, group.list_commands(ctx), n=3, cutoff=0.6)
+        hint = f" Did you mean {', '.join(close)}?" if close else f" Run '{help_path} --help' for the list."
+        ctx.fail(f"No such command {name!r}.{hint}")
+    return command.name if command is not None else None, command, args[1:]
 
 
 class ToolCommand(click.Command):
@@ -507,7 +738,7 @@ class ToolCommand(click.Command):
         return click.UsageError(f"{error.format_message()}\n\n{self.compiled.summary()}", error.ctx or ctx)
 
     def invoke(self, ctx: click.Context) -> None:
-        mode = resolve_mode(_mode(ctx), _mode(ctx.find_root()))
+        mode = resolve_mode(*_modes(ctx))
         try:
             arguments = self.compiled.arguments(ctx.params)
         except click.UsageError as error:
