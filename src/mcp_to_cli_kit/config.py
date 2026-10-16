@@ -3,7 +3,8 @@
 The configuration comes from three layers, each overriding the one before it:
 
 1. the default the consumer package passes in code, in the same shape as the file;
-2. the YAML file, ``~/.config/<bin>/config.yaml`` or the path given by ``--config``;
+2. the YAML file, ``$XDG_CONFIG_HOME/<bin>/config.yaml`` (``~/.config/<bin>/config.yaml`` when
+   the variable is unset) or the path given by ``--config``;
 3. environment variables named ``<PREFIX><KEY>``, where the prefix is derived from the bin
    name (``my-tool`` becomes ``MY_TOOL_``) and nested keys are joined with ``__``.
 
@@ -102,7 +103,9 @@ class ServerConfig(_StrictModel):
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
     timeout: Annotated[float, Field(gt=0)] = 30.0
-    sse_read_timeout: Annotated[float, Field(gt=0)] = 300.0
+    # Below the 120 s after which a coding agent's shell tool typically kills a command, so the
+    # agent sees a timeout error rather than a killed process.
+    sse_read_timeout: Annotated[float, Field(gt=0)] = 100.0
     mount: Mount = "root"
     tool_groups: list[ToolGroup] = Field(default_factory=list)
     hidden_tools: list[str] = Field(default_factory=list)
@@ -170,8 +173,16 @@ class LoadedConfig:
 
 
 def default_config_path(bin_name: str) -> Path:
-    """Return ``~/.config/<bin>/config.yaml``."""
-    return Path.home() / ".config" / bin_name / CONFIG_FILE_NAME
+    """Return ``$XDG_CONFIG_HOME/<bin>/config.yaml``, by default ``~/.config/<bin>/config.yaml``."""
+    return xdg_directory("XDG_CONFIG_HOME", ".config") / bin_name / CONFIG_FILE_NAME
+
+
+def xdg_directory(variable: str, fallback: str) -> Path:
+    """An XDG base directory: the variable when it holds an absolute path, ``~/<fallback>`` otherwise."""
+    value = os.environ.get(variable, "")
+    if value and Path(value).is_absolute():
+        return Path(value)
+    return Path.home() / fallback
 
 
 def resolve_config_path(bin_name: str, explicit: str | os.PathLike[str] | None = None) -> Path:

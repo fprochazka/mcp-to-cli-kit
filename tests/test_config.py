@@ -44,15 +44,6 @@ DEFAULT: dict[str, Any] = {
 }
 
 
-@pytest.fixture(autouse=True)
-def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Point the home directory at an empty temporary one."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    return home
-
-
 def write_yaml(path: Path, data: Any) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -577,7 +568,7 @@ class TestModel:
 
         assert server.headers == {}
         assert server.timeout == 30
-        assert server.sse_read_timeout == 300
+        assert server.sse_read_timeout == 100
         assert server.mount == "root"
         assert server.tool_groups == []
         assert server.hidden_tools == []
