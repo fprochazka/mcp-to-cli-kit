@@ -306,6 +306,7 @@ class TestCollisions:
     def test_disjoint_tools_do_not_collide(self, invoke: Invoke, alpha: RunningServer, beta: RunningServer) -> None:
         names = ["no_args", "search_items", "fail", "big", "multi", "plain_text", "raw_json", "structured"]
         names += ["wrapped_text", "slow", "error_as_text", "svc_a_list", "svc_a_get", "svc_b_search"]
+        names += ["vendor-x_list", "vendor-x_no_args", "vendor_x-svc_c_find"]
         default = config(
             {"url": alpha.url, "hidden_tools": [n for n in names if n != "no_args"]},
             {"url": beta.url, "hidden_tools": [n for n in names if n != "raw_json"]},

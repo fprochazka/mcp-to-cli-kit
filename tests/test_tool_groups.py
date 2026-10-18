@@ -204,7 +204,7 @@ class TestHiddenTools:
         listed = invoke(["--help"], default=default)
         called = invoke(["no-args"], default=default)
 
-        assert "no-args" not in listed.stdout
+        assert "\n  no-args " not in listed.stdout
         assert called.exit_code == 2
         assert "No such command 'no-args'" in called.stderr
         assert json_server.recorder.calls() == []

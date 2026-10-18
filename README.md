@@ -137,6 +137,22 @@ Each server keeps its own session, cache file (`<cache>/<bin>/<server>.json`), h
 
 Two servers must not produce the same command name. When the tool lists show that they do (two root servers with a tool of the same name, or a group named like a top-level tool), the CLI stops with a config error that names both servers; give one of them a group or prefix mount, or hide the tool with `hidden_tools`. Calling a group checks the other servers only from what is already known (their caches), so a clash with a server whose tools were never fetched surfaces in the top-level `--help`. When a command resolves on one server while another server that could also define it cannot be reached, the CLI runs it and warns that the other server could not be checked.
 
+### Stripping prefixes from tool names
+
+Some servers put their own name in front of every tool (`vendor-x_list`, `vendor-x_get`). `strip_prefixes` removes it from the command names:
+
+```yaml
+servers:
+  example:
+    url: https://mcp.example.com/mcp
+    strip_prefixes: [vendor-x_, vendor_x-]   # vendor-x_list -> example-tool list
+```
+
+- The first prefix in the list that a tool name starts with is stripped. A name that equals the prefix is kept.
+- It works in every mount mode and happens before tool groups and mounts: `tool_groups` prefixes match the stripped names, and a group or prefix mount applies to the stripped command (`prefix: "v-"` gives `example-tool v-list`).
+- The tool's own name stays an alias (`example-tool vendor-x_list`), and `hidden_tools` still lists tools by their own names.
+- When a stripped name would clash with another tool or a tool group of the same server (`vendor-x_list` next to a plain `list`), that tool keeps its full name and the CLI warns on stderr, so neither tool hides the other; hide one of them with `hidden_tools` to silence it. A clash with another server's tool is a config error, as for any other command name.
+
 ### Tool groups and hidden tools
 
 A server with many tools can split them into subcommands by tool-name prefix:

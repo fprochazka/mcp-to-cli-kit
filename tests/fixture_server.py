@@ -243,6 +243,21 @@ def build_server(json_response: bool) -> FastMCP:
         """Take nothing."""
         return '"done"'
 
+    @mcp.tool(name="vendor-x_list", structured_output=False)
+    def vendor_x_list() -> str:
+        """List the vendor items; a tool name with a vendor prefix."""
+        return '["v1"]'
+
+    @mcp.tool(name="vendor-x_no_args", structured_output=False)
+    def vendor_x_no_args() -> str:
+        """Take nothing, under a vendor prefix; clashes with no_args once the prefix is stripped."""
+        return '"vendor done"'
+
+    @mcp.tool(name="vendor_x-svc_c_find", structured_output=False)
+    def vendor_x_svc_c_find(query: str) -> str:
+        """Find in service C, under the other spelling of the vendor prefix."""
+        return '{"found": "' + query + '"}'
+
     @mcp.tool(structured_output=False)
     def error_as_text() -> str:
         """Report a failure as an ordinary result."""

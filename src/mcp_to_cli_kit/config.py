@@ -22,6 +22,7 @@ Environment variables::
                                              a header; "_" becomes "-" unless the header
                                              already exists under another spelling
     MY_TOOL_SERVERS__ALPHA__HIDDEN_TOOLS='["a", "b"]'
+    MY_TOOL_SERVERS__ALPHA__STRIP_PREFIXES='["vendor_"]'
                                              lists, objects and mounts are given as JSON
     MY_TOOL_SERVERS__BETA__MOUNT__GROUP=b    one key of a mount, which replaces the whole mount
 
@@ -119,6 +120,8 @@ class ServerConfig(_StrictModel):
     # agent sees a timeout error rather than a killed process.
     sse_read_timeout: Annotated[float, Field(gt=0)] = 100.0
     mount: Mount = "root"
+    # Stripped from the start of tool names before anything else; the first matching prefix wins.
+    strip_prefixes: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
     tool_groups: list[ToolGroup] = Field(default_factory=list)
     hidden_tools: list[str] = Field(default_factory=list)
 
@@ -137,6 +140,7 @@ class ServerConfig(_StrictModel):
 
     @model_validator(mode="after")
     def _tool_groups_are_distinct(self) -> ServerConfig:
+        _reject_duplicates("strip_prefixes entry", self.strip_prefixes)
         _reject_duplicates("tool_groups prefix", [group.prefix for group in self.tool_groups])
         _reject_duplicates("tool_groups group", [group.group for group in self.tool_groups])
         return self
@@ -375,7 +379,7 @@ def _env_key(name: str) -> str:
 
 _SERVER_FIELDS = {_env_key(name): name for name in ServerConfig.model_fields}
 
-_JSON_FIELDS = {"headers", "mount", "tool_groups", "hidden_tools"}
+_JSON_FIELDS = {"headers", "mount", "strip_prefixes", "tool_groups", "hidden_tools"}
 
 
 def _read_env(environ: Mapping[str, str], prefix: str, merged: Mapping[str, Any]) -> dict[str, Any]:

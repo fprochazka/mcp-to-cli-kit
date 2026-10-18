@@ -128,12 +128,21 @@ class ToolEntry:
         return str(self.tool["name"])
 
 
+def _normalized(name: str) -> str:
+    return name.replace("-", "_")
+
+
 @dataclass
 class ToolIndex:
-    """Tool commands by command name, with the tool's own spellings as aliases."""
+    """Tool commands by command name, with the tool's own spellings as aliases.
+
+    Exact aliases are looked up before the spellings with ``-`` turned into ``_``, so a tool's own
+    name always finds that tool, whatever order the tools were added in.
+    """
 
     entries: dict[str, ToolEntry] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
+    normalized_aliases: dict[str, str] = field(default_factory=dict)
 
     def add(self, server: str, local_name: str, tool: dict[str, Any], aliases: tuple[str, ...]) -> str | None:
         """Add a tool under the kebab case of ``local_name``; returns the command name, None when it is taken.
@@ -151,24 +160,36 @@ class ToolIndex:
         self.entries[command] = ToolEntry(server, command, tool)
         for alias in (local_name, *aliases):
             self.aliases.setdefault(alias, command)
-            self.aliases.setdefault(alias.replace("-", "_"), command)
+            self.normalized_aliases.setdefault(_normalized(alias), command)
         return command
 
-    def find(self, name: str) -> ToolEntry | None:
+    def find_exact(self, name: str) -> ToolEntry | None:
+        """A command name or an exact alias."""
         if name in self.entries:
             return self.entries[name]
-        alias = self.aliases.get(name) or self.aliases.get(name.replace("-", "_"))
+        alias = self.aliases.get(name)
         return self.entries.get(alias) if alias is not None else None
+
+    def find_normalized(self, name: str) -> ToolEntry | None:
+        """An alias spelled with ``-`` and ``_`` swapped."""
+        alias = self.normalized_aliases.get(_normalized(name))
+        return self.entries.get(alias) if alias is not None else None
+
+    def find(self, name: str) -> ToolEntry | None:
+        return self.find_exact(name) or self.find_normalized(name)
 
 
 @dataclass
 class ServerTools(ToolIndex):
     """The tool commands of one server, before any mount prefix.
 
-    Tools whose names start with a ``tool_groups`` prefix live in that group, under their name
-    without the prefix; the rest stay here, at the server's mount level. The longest matching
-    prefix wins. A grouped tool's full name still finds it from the mount level, as an alias.
-    Hidden tools are left out before grouping, so they are in no group either.
+    A ``strip_prefixes`` entry is first stripped from the tool names (see ``_local_names``); the
+    tool's own name stays an alias, and ``hidden_tools`` still lists the tools by their own names.
+    Tool groups match the stripped names. Tools whose names start with a ``tool_groups`` prefix
+    live in that group, under their name without the prefix; the rest stay here, at the server's
+    mount level. The longest matching prefix wins. A grouped tool's full name still finds it from
+    the mount level, as an alias. Hidden tools are left out before grouping, so they are in no
+    group either.
 
     Attributes:
         groups: The tool groups by group name, each with its tools.
@@ -178,41 +199,104 @@ class ServerTools(ToolIndex):
     groups: dict[str, ToolIndex] = field(default_factory=dict)
     clashes: list[str] = field(default_factory=list)
     grouped_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
+    normalized_grouped_aliases: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     @classmethod
     def build(
-        cls, server: str, tools: list[dict[str, Any]], hidden: list[str], tool_groups: list[ToolGroup]
+        cls,
+        server: str,
+        tools: list[dict[str, Any]],
+        hidden: list[str],
+        tool_groups: list[ToolGroup],
+        strip_prefixes: Sequence[str] = (),
     ) -> ServerTools:
         index = cls(groups={group.group: ToolIndex() for group in tool_groups})
         by_prefix = sorted(tool_groups, key=lambda group: len(group.prefix), reverse=True)
-        hidden_names = set(hidden)
-        for tool in tools:
-            name = tool.get("name")
-            if not isinstance(name, str) or not name or name in hidden_names:
-                continue
-            group = next((g for g in by_prefix if name.startswith(g.prefix) and len(name) > len(g.prefix)), None)
+        group_names = [group.group for group in tool_groups]
+        for name, local, tool in _local_names(server, tools, hidden, strip_prefixes, group_names):
+            aliases = (name,) if local != name else ()
+            group = next((g for g in by_prefix if local.startswith(g.prefix) and len(local) > len(g.prefix)), None)
             if group is None:
-                index.add(server, name, tool, ())
+                index.add(server, local, tool, aliases)
                 continue
-            command = index.groups[group.group].add(server, name[len(group.prefix) :], tool, (name,))
+            command = index.groups[group.group].add(server, local[len(group.prefix) :], tool, (local, *aliases))
             if command is not None:
-                for alias in (name, name.replace("-", "_")):
+                for alias in (local, *aliases):
                     index.grouped_aliases.setdefault(alias, (group.group, command))
+                    index.normalized_grouped_aliases.setdefault(_normalized(alias), (group.group, command))
         index.clashes = sorted(set(index.entries) & set(index.groups))
         return index
 
     def find(self, name: str) -> ToolEntry | None:
-        entry = super().find(name)
-        if entry is not None:
-            return entry
-        grouped = self.grouped_aliases.get(name) or self.grouped_aliases.get(name.replace("-", "_"))
-        if grouped is None:
-            return None
-        return self.groups[grouped[0]].entries.get(grouped[1])
+        """Exact names before normalized spellings, the mount level before the tool groups."""
+        return (
+            self.find_exact(name)
+            or self._grouped(self.grouped_aliases.get(name))
+            or self.find_normalized(name)
+            or self._grouped(self.normalized_grouped_aliases.get(_normalized(name)))
+        )
+
+    def _grouped(self, target: tuple[str, str] | None) -> ToolEntry | None:
+        return self.groups[target[0]].entries.get(target[1]) if target is not None else None
 
     def find_in_group(self, group: str, name: str) -> ToolEntry | None:
         tools = self.groups.get(group)
         return tools.find(name) if tools is not None else None
+
+
+def _local_names(
+    server: str,
+    tools: list[dict[str, Any]],
+    hidden: list[str],
+    strip_prefixes: Sequence[str],
+    group_names: Sequence[str] = (),
+) -> list[tuple[str, str, dict[str, Any]]]:
+    """Each visible tool's own name and the name its command is built from, with ``strip_prefixes`` applied.
+
+    The first configured prefix the name starts with is stripped, unless nothing would be left.
+    ``hidden`` lists tools by their own names. A stripped name whose command would clash with
+    another tool's command, or with one of the server's tool groups, is not stripped, and the
+    clash is logged as a warning, so neither side shadows the other. A tool that keeps its full
+    name can clash anew, so this repeats until nothing changes; the outcome does not depend on
+    the order the server lists its tools in.
+    """
+    hidden_names = set(hidden)
+    stripped: list[tuple[str, str, dict[str, Any]]] = []
+    for tool in tools:
+        name = tool.get("name")
+        if not isinstance(name, str) or not name or name in hidden_names:
+            continue
+        prefix = next((p for p in strip_prefixes if name.startswith(p) and len(name) > len(p)), "")
+        stripped.append((name, name[len(prefix) :], tool))
+
+    reserved = set(group_names)
+    kept: dict[str, list[str]] = {}  # tools that keep their full name, with what they would clash with
+    while True:
+        commands: dict[str, list[str]] = {}
+        for name, local, _ in stripped:
+            commands.setdefault(kebab_case(name if name in kept else local), []).append(name)
+        changed = False
+        for name, local, _ in stripped:
+            if local == name or name in kept:
+                continue
+            command = kebab_case(local)
+            others = [other for other in commands[command] if other != name]
+            if others or command in reserved:
+                kept[name] = others if others else [f"the tool group {command}"]
+                changed = True
+        if not changed:
+            break
+
+    for name in sorted(kept):
+        local = next(local for other, local, _ in stripped if other == name)
+        logger.warning(
+            "Not stripping the prefix from the tool %r of %s: %r would clash with %s",
+            name,
+            server,
+            local,
+            ", ".join(sorted(other if other.startswith("the tool group") else repr(other) for other in kept[name])),
+        )
+    return [(name, name if name in kept else local, tool) for name, local, tool in stripped]
 
 
 @dataclass
@@ -293,7 +377,7 @@ class Runtime:
 
     def _index(self, server: str, tools: list[dict[str, Any]]) -> ServerTools:
         config = self.config.servers[server]
-        index = ServerTools.build(server, tools, config.hidden_tools, config.tool_groups)
+        index = ServerTools.build(server, tools, config.hidden_tools, config.tool_groups, config.strip_prefixes)
         if index.clashes:
             names = ", ".join(repr(name) for name in index.clashes)
             raise ConfigFailure(
