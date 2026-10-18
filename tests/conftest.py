@@ -37,10 +37,14 @@ def sse_server() -> Iterator[RunningServer]:
 
 @pytest.fixture(autouse=True)
 def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """An empty home directory and no AI agent, for every test."""
+    """An empty home directory, no XDG directory overrides and no AI agent, for every test."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # The kit honors these, and CI runners set them: without this, tests would read and write
+    # the runner's real config and cache. Tests of the XDG behavior set them explicitly.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     for variable in ALL_AGENT_VARS:
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(agent_module, "DEVIN_MARKER", Path("/nonexistent-devin-marker"))
