@@ -106,7 +106,7 @@ class TestUrlValidation:
             (f"{SECRET}://host/mcp", "must be an http:// or https:// URL."),
             (f"{SECRET}", "without a scheme"),
             ("https:///mcp", "with a host"),
-            (f"http://127.0.0.1:{SECRET}/mcp", "is not a valid URL"),
+            (f"http://127.0.0.1:{SECRET}/mcp", "with a valid host and numeric port"),
             (f"http://127.0.0.1/mcp\n{SECRET}", "is not a valid URL"),
         ],
     )
@@ -132,7 +132,10 @@ class TestUrlValidation:
         template = ServerConfig(url="http://127.0.0.1:${EXAMPLE_PORT}/mcp")
 
         assert expand_server("alpha", template, {"EXAMPLE_PORT": "8443"}).url == "http://127.0.0.1:8443/mcp"
-        with pytest.raises(ConfigError, match="once EXAMPLE_PORT is expanded, is not a valid URL") as raised:
+        with pytest.raises(
+            ConfigError,
+            match="once EXAMPLE_PORT is expanded, must be an http:// or https:// URL with a valid host and numeric",
+        ) as raised:
             expand_server("alpha", template, {"EXAMPLE_PORT": SECRET})
         assert SECRET not in str(raised.value)
 
@@ -140,7 +143,7 @@ class TestUrlValidation:
     def test_a_value_that_moves_text_into_another_part(self, value: str) -> None:
         template = ServerConfig(url="http://user:${EXAMPLE_TOKEN}@mcp.example.com/mcp")
 
-        with pytest.raises(ConfigError, match="once EXAMPLE_TOKEN is expanded, is not") as raised:
+        with pytest.raises(ConfigError, match="once EXAMPLE_TOKEN is expanded, (is not|must be)") as raised:
             expand_server("alpha", template, {"EXAMPLE_TOKEN": value})
 
         assert SECRET not in str(raised.value)

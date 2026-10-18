@@ -270,6 +270,10 @@ def check_http_url(url: str, *, show_scheme: bool = True) -> None:
         raise ValueError(f"must be an http:// or https:// URL{got}")
     if not re.match(r"^[^/\s?#]+", rest):
         raise ValueError("must be an http:// or https:// URL with a host")
+    try:
+        urlsplit(url).port  # noqa: B018 - reading it validates it
+    except ValueError:
+        raise ValueError("must be an http:// or https:// URL with a valid host and numeric port") from None
 
 
 def expand_server(name: str, server: ServerConfig, environ: Mapping[str, str] | None = None) -> ResolvedServer:
