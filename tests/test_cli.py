@@ -703,6 +703,36 @@ class TestProcessBehaviour:
         assert result.exit_code == code
         assert message in result.stderr
 
+    @pytest.mark.parametrize("failure", ["dead port", "401", "dropped connection", "none"])
+    def test_help_exits_promptly_when_the_listing_fails(
+        self, json_server: RunningServer, home: Path, failure: str
+    ) -> None:
+        """Run as a real process: the open session's event loop thread must not keep it alive."""
+        url = free_port_url() if failure == "dead port" else json_server.url
+        if failure == "401":
+            json_server.recorder.fail_with = [401] * 5
+        elif failure == "dropped connection":
+            json_server.recorder.fail_method = "initialize"
+            json_server.recorder.break_mode = "drop"
+        code = (
+            "import sys; from mcp_to_cli_kit.cli import main; "
+            f"main({BIN!r}, {{'servers': {{'example': {{'url': {url!r}}}}}}}, args=sys.argv[1:])"
+        )
+
+        started = time.monotonic()
+        completed = subprocess.run(
+            [sys.executable, "-c", code, "--help"],
+            env={**os.environ, "HOME": str(home)},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+
+        assert completed.returncode == (0 if failure == "none" else 3), completed.stderr
+        assert elapsed < 10
+        assert "Traceback" not in completed.stderr
+
     def test_closed_pipe_is_quiet(self, json_server: RunningServer, home: Path) -> None:
         code = (
             "import sys; from mcp_to_cli_kit.cli import main; "

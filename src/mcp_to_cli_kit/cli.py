@@ -778,6 +778,19 @@ class KitGroup(click.Group):
             sys.exit(EXIT_INTERRUPTED)
         sys.exit(result if isinstance(result, int) else 0)
 
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        """Close the context when parsing fails, so the runtime it may already hold is closed too.
+
+        ``--help`` lists the tools while the group's own arguments are parsed, before click
+        enters the context, so click would never run the close callbacks of a failed listing;
+        the open sessions and their event loop thread would then keep the process alive.
+        """
+        try:
+            return super().parse_args(ctx, args)
+        except BaseException:
+            ctx.close()
+            raise
+
     def get_help_option(self, ctx: click.Context) -> click.Option | None:
         # Not eager, so the eager --config and --refresh-tools are already known when the help lists the tools.
         option = super().get_help_option(ctx)
