@@ -5,7 +5,22 @@ description = "Build a typed command-line interface for one or more remote MCP s
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ name = "Filip Procházka" }]
+authors = [{ name = "Filip Procházka", email = "dev@fprochazka.cz" }]
+keywords = ["mcp", "model-context-protocol", "cli", "click", "json-schema", "ai-agent"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: User Interfaces",
+  "Typing :: Typed",
+]
 requires-python = ">=3.11"
 dependencies = [
   "click>=8.1,<9",
@@ -15,6 +30,11 @@ dependencies = [
   "pydantic>=2.7,<3",
   "pyyaml>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/fprochazka/mcp-to-cli-kit"
+Repository = "https://github.com/fprochazka/mcp-to-cli-kit"
+Issues = "https://github.com/fprochazka/mcp-to-cli-kit/issues"
 
 [build-system]
 requires = ["hatchling"]
