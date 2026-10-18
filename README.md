@@ -117,6 +117,27 @@ servers:
     sse_read_timeout: 100  # seconds to wait for an answer, streamed or not
 ```
 
+### Environment variables in values
+
+The `url` and the `headers` values may refer to environment variables as `${NAME}`, so a token can stay out of the config file and the code default:
+
+```yaml
+servers:
+  example:
+    url: https://${EXAMPLE_HOST}/mcp
+    headers:
+      Authorization: "Bearer ${EXAMPLE_TOKEN}"
+```
+
+- References are expanded when the CLI contacts the server, never when the config is loaded. An unset variable therefore fails only a command that needs that server, with a config error (exit code 2) that names the variable and the server, and never shows a value. An empty variable counts as set.
+- `--help`, a tool's `--help` and `schema` still work offline from a fresh tool cache when the variable is unset. With an expired cache the CLI warns and uses it, as when the server is down.
+- A template can come from any layer: the code default, the config file, or an environment variable such as `EXAMPLE_TOOL_SERVERS__EXAMPLE__HEADERS__AUTHORIZATION='Bearer ${EXAMPLE_TOKEN}'`.
+- `$${` is a literal `${`. A `$` not followed by `{` stays as it is. A `${` without a closing `}`, or one that does not enclose a variable name (letters, digits and `_`), is a config error when the config is loaded.
+- Only `url` and the header values are expanded. Names (servers, mounts, tool groups, tools) and help texts are taken as written.
+- A URL with references is checked once it is expanded: it must be a valid http(s) URL, and no value may move text into another part of the URL (a `/`, `?`, `#` or `@` in a password, for example), so percent-encode such characters in the variable. An expanded header value must not hold control or non-ASCII characters. Each of these is a config error that names the variable, never its value.
+- Error messages show the URL as configured, with `${NAME}` unexpanded and without its userinfo and query. The parts that carry secrets (the values of the variables in the headers, and the userinfo, password, query and fragment of the expanded URL, also in their percent-encoded forms, if they are 4 characters or longer) are also replaced in transport errors and in the `-v` / `-vv` log. Host, port and path values are not secrets and are shown.
+- The tool cache remembers a hash of the URL as configured and one of the expanded URL. Pointing a variable at another server fetches that server's tools; with the variable unset, the cache of the configured URL is used.
+
 ### Several servers in one bin
 
 A bin can serve several MCP servers. Each server says where its tools appear with `mount`:

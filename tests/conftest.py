@@ -11,6 +11,7 @@ from click.testing import CliRunner, Result
 from fixture_server import RunningServer, start
 
 from mcp_to_cli_kit import agent as agent_module
+from mcp_to_cli_kit import redaction
 from mcp_to_cli_kit.agent import AGENT_ENV_VARS, GENERIC_AGENT_ENV_VARS
 from mcp_to_cli_kit.cli import ResultClassifier, build_cli
 
@@ -49,6 +50,14 @@ def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(agent_module, "DEVIN_MARKER", Path("/nonexistent-devin-marker"))
     return home
+
+
+@pytest.fixture(autouse=True)
+def clear_redaction() -> Iterator[None]:
+    """Forget the secrets earlier tests registered, which would otherwise redact this test's output."""
+    redaction.clear()
+    yield
+    redaction.clear()
 
 
 @pytest.fixture(autouse=True)

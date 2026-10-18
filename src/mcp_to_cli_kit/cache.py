@@ -6,6 +6,11 @@ A cache entry is fresh for an hour. An expired entry is still kept: when the ser
 be reached, the CLI falls back to it rather than failing to know its own commands. The entry
 records a hash of the server URL, never the URL itself, which may carry a token; an entry
 written for another URL is ignored.
+
+A configured URL may be a template with ``${NAME}`` references. The entry then records a hash
+of the template and one of the expanded URL. When the variables are set, both must match, so
+pointing a variable at another server does not reuse the old server's tools; when one is not
+set, the template alone decides, so ``--help`` still lists the tools offline.
 """
 
 from __future__ import annotations
@@ -60,8 +65,14 @@ class SchemaCache:
         """The cache file of one server."""
         return self.directory / f"{server}.json"
 
-    def load(self, server: str, url: str) -> CachedTools | None:
-        """Return the cached tools of a server, fresh or expired, or None when there is no usable entry."""
+    def load(self, server: str, url: str, resolved_url: str | None = None) -> CachedTools | None:
+        """Return the cached tools of a server, fresh or expired, or None when there is no usable entry.
+
+        Args:
+            server: The server's name.
+            url: The URL as configured, a template or not.
+            resolved_url: The URL with its variables expanded, or None when they cannot be.
+        """
         path = self.path(server)
         try:
             content = json.loads(path.read_text(encoding="utf-8"))
@@ -75,6 +86,7 @@ class SchemaCache:
             not isinstance(content, dict)
             or content.get("version") != _FORMAT_VERSION
             or content.get("url_sha256") != _url_hash(url)
+            or (resolved_url not in (None, url) and content.get("resolved_url_sha256") != _url_hash(resolved_url))
             or not isinstance(content.get("tools"), list)
             or not isinstance(content.get("fetched_at"), int | float)
         ):
@@ -86,9 +98,12 @@ class SchemaCache:
         tools = [tool for tool in content["tools"] if isinstance(tool, dict)]
         return CachedTools(tools=tools, fetched_at=fetched_at, fresh=0 <= age < self.ttl_seconds)
 
-    def save(self, server: str, url: str, tools: list[dict[str, Any]]) -> None:
+    def save(self, server: str, url: str, tools: list[dict[str, Any]], resolved_url: str | None = None) -> None:
         """Write a server's tools atomically. A failure to write is logged, never raised."""
-        content = {"version": _FORMAT_VERSION, "url_sha256": _url_hash(url), "fetched_at": time.time(), "tools": tools}
+        content: dict[str, Any] = {"version": _FORMAT_VERSION, "url_sha256": _url_hash(url)}
+        if resolved_url is not None and resolved_url != url:
+            content["resolved_url_sha256"] = _url_hash(resolved_url)
+        content.update(fetched_at=time.time(), tools=tools)
         path = self.path(server)
         try:
             self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)

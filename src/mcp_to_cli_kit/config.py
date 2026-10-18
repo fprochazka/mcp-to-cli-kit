@@ -30,6 +30,11 @@ The whole variable name, the prefix included, is matched case-insensitively, and
 name matches with ``-`` and ``_`` treated as the same character. Server names therefore
 cannot contain two separators in a row, which would read as the ``__`` nesting.
 
+Values of ``url`` and of ``headers`` may refer to environment variables as ``${NAME}``
+(``$${`` gives a literal ``${``; a ``$`` not followed by ``{`` stays as it is). The references
+are kept as written when the config is loaded and expanded only when a server is contacted,
+so an unset variable fails only the commands that need that server. See ``expand_server``.
+
 Environment variables cannot add a server, only change one the default or the file defines.
 A variable that names no configured server or no known key is ignored and logged at debug
 level, so a short prefix does not break the CLI over an unrelated variable. A known server
@@ -47,9 +52,13 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
+import httpx
 import yaml
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+from mcp_to_cli_kit import redaction
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +120,11 @@ class ToolGroup(_StrictModel):
 
 
 class ServerConfig(_StrictModel):
-    """One MCP server and where its tools appear in the bin."""
+    """One MCP server and where its tools appear in the bin.
+
+    ``url`` and the ``headers`` values are templates that may refer to environment variables as
+    ``${NAME}``; ``expand_server`` resolves them when the server is contacted.
+    """
 
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
@@ -128,15 +141,21 @@ class ServerConfig(_StrictModel):
     @field_validator("url")
     @classmethod
     def _url_is_http(cls, url: str) -> str:
-        # The URL may carry a token, so the message never repeats more than its scheme.
-        scheme, separator, rest = url.partition("://")
-        if not separator:
-            raise ValueError("must be an http:// or https:// URL, got a value without a scheme")
-        if scheme.lower() not in ("http", "https"):
-            raise ValueError(f"must be an http:// or https:// URL, got the scheme {scheme[:16]!r}")
-        if not re.match(r"^[^/\s?#]+", rest):
-            raise ValueError("must be an http:// or https:// URL with a host")
+        parts = parse_template(url)
+        # A URL with references is checked once they are expanded, when the server is contacted.
+        if not any(isinstance(part, VariableReference) for part in parts):
+            check_http_url(_join(parts, {}))
         return url
+
+    @field_validator("headers")
+    @classmethod
+    def _headers_are_templates(cls, headers: dict[str, str]) -> dict[str, str]:
+        for name, value in headers.items():
+            try:
+                parse_template(value)
+            except ValueError as error:
+                raise ValueError(f"header {name}: {error}") from None
+        return headers
 
     @model_validator(mode="after")
     def _tool_groups_are_distinct(self) -> ServerConfig:
@@ -171,6 +190,202 @@ class CliConfig(_StrictModel):
             "top-level command name", groups + top_level_tool_groups, explain="from group mounts and tool_groups"
         )
         return self
+
+
+@dataclass(frozen=True)
+class VariableReference:
+    """A ``${NAME}`` in a config value."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class ResolvedServer:
+    """A server's ``url`` and ``headers`` with every ``${NAME}`` expanded. Holds secrets; never print it."""
+
+    url: str
+    headers: dict[str, str]
+
+
+_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def parse_template(value: str) -> list[str | VariableReference]:
+    """Split a config value into literal text and ``${NAME}`` references.
+
+    ``$${`` is a literal ``${``, and a ``$`` that does not start ``${`` is literal text.
+
+    Raises:
+        ValueError: A ``${`` has no closing ``}``, or what it encloses is not a variable name
+            (letters, digits and ``_``, not starting with a digit). The message never repeats
+            the value, which may be a secret.
+    """
+    parts: list[str | VariableReference] = []
+    literal: list[str] = []
+    position = 0
+    while position < len(value):
+        if value.startswith("$${", position):
+            literal.append("${")
+            position += 3
+        elif value.startswith("${", position):
+            end = value.find("}", position + 2)
+            if end < 0:
+                raise ValueError("has a ${ without a closing }; write $${ for a literal ${")
+            name = value[position + 2 : end]
+            if not _VARIABLE_NAME.fullmatch(name):
+                raise ValueError(
+                    "has a ${...} that does not enclose a variable name (letters, digits and _); "
+                    "write $${ for a literal ${"
+                )
+            if literal:
+                parts.append("".join(literal))
+                literal = []
+            parts.append(VariableReference(name))
+            position = end + 1
+        else:
+            literal.append(value[position])
+            position += 1
+    if literal:
+        parts.append("".join(literal))
+    return parts
+
+
+def template_variables(value: str) -> list[str]:
+    """The names of the variables a config value refers to, in order, without duplicates."""
+    names = [part.name for part in parse_template(value) if isinstance(part, VariableReference)]
+    return list(dict.fromkeys(names))
+
+
+def check_http_url(url: str, *, show_scheme: bool = True) -> None:
+    """Raise ValueError unless the URL is http(s) with a host.
+
+    The URL may carry a token, so the message never repeats more than its scheme, and not even
+    that without ``show_scheme``.
+    """
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        raise ValueError("must be an http:// or https:// URL, got a value without a scheme")
+    if scheme.lower() not in ("http", "https"):
+        got = f", got the scheme {scheme[:16]!r}" if show_scheme else ""
+        raise ValueError(f"must be an http:// or https:// URL{got}")
+    if not re.match(r"^[^/\s?#]+", rest):
+        raise ValueError("must be an http:// or https:// URL with a host")
+
+
+def expand_server(name: str, server: ServerConfig, environ: Mapping[str, str] | None = None) -> ResolvedServer:
+    """Expand the ``${NAME}`` references in a server's ``url`` and ``headers``.
+
+    Each expanded value, and the userinfo and query of the expanded URL, are registered with
+    ``redaction``, so they are kept out of transport errors and logs from then on.
+
+    Args:
+        name: The server's name, for the error message.
+        server: The server's configuration, with the references as written.
+        environ: The environment to read, ``os.environ`` when None.
+
+    Raises:
+        ConfigError: A variable is not set; the expanded URL is not a valid http(s) URL, or a
+            variable's value changes which part of the URL the text around it belongs to; or an
+            expanded header value holds a control or non-ASCII character. The message names the
+            server, the key and the variables, never a value.
+    """
+    environ = os.environ if environ is None else environ
+    url = _expand(name, "url", server.url, environ)
+    url_variables = template_variables(server.url)
+    _check_expanded_url(name, server.url, url, url_variables, environ)
+
+    headers = {}
+    for header, value in server.headers.items():
+        expanded = _expand(name, f"header {header}", value, environ)
+        if any(ord(character) < 0x20 or ord(character) >= 0x7F for character in expanded):
+            variables = template_variables(value)
+            source = f" (from {', '.join(variables)})" if variables else ""
+            raise ConfigError(f"Server {name}: header {header}{source} holds a control or non-ASCII character.")
+        headers[header] = expanded
+
+    _register_secrets(server, url, environ)
+    return ResolvedServer(url=url, headers=headers)
+
+
+def _register_secrets(server: ServerConfig, url: str, environ: Mapping[str, str]) -> None:
+    """Register the parts of a server's expanded config that carry secrets with ``redaction``.
+
+    Those are the values of the variables in the headers, the userinfo, the query and the
+    fragment, and the userinfo, password, query and fragment of the expanded URL. The fragment is
+    never sent, but the SDK and httpx log it. Host, port and path are left alone.
+    """
+    template = urlsplit(server.url)
+    secret_templates = [*server.headers.values()]
+    if template.scheme and template.netloc:
+        secret_templates += [template.netloc.rpartition("@")[0], template.query, template.fragment]
+    for value in secret_templates:
+        for variable in template_variables(value):
+            redaction.register_encoded(environ[variable], "${" + variable + "}")
+
+    parts = urlsplit(url)
+    userinfo = parts.netloc.rpartition("@")[0]
+    secrets = [userinfo, userinfo.partition(":")[2], parts.query, parts.fragment]
+    parsed = httpx.URL(url)
+    secrets += [
+        parsed.userinfo.decode("ascii", "replace"),
+        parsed.password or "",
+        parsed.query.decode("ascii", "replace"),
+    ]
+    for secret in secrets:
+        redaction.register_encoded(secret, "***")
+
+
+def _check_expanded_url(name: str, template: str, url: str, variables: list[str], environ: Mapping[str, str]) -> None:
+    if not variables:
+        return  # checked when the config was loaded
+    prefix = f"Server {name}: url, once {', '.join(variables)} {'is' if len(variables) == 1 else 'are'} expanded,"
+    template_scheme = template.partition("://")[0] if "://" in template else "${"
+    try:
+        check_http_url(url, show_scheme="${" not in template_scheme)
+    except ValueError as error:
+        raise ConfigError(f"{prefix} {error}.") from None
+    try:
+        httpx.URL(url)
+        expanded_parts = tuple(urlsplit(url))
+        template_parts = urlsplit(template)
+    except (httpx.InvalidURL, ValueError):
+        raise ConfigError(f"{prefix} is not a valid URL.") from None
+    if template_parts.scheme and template_parts.netloc:
+        expected = tuple(_join(parse_template(part), environ) for part in template_parts)
+        if expanded_parts != expected:
+            raise ConfigError(
+                f"{prefix} is not the URL the template describes: a value holds a /, ?, # or @ "
+                "that moves text into another part of the URL. Percent-encode it."
+            )
+
+
+def expand_url(server: ServerConfig, environ: Mapping[str, str] | None = None) -> str | None:
+    """A server's expanded URL, or None when a variable it refers to is not set."""
+    environ = os.environ if environ is None else environ
+    parts = parse_template(server.url)
+    if any(isinstance(part, VariableReference) and part.name not in environ for part in parts):
+        return None
+    return _join(parts, environ)
+
+
+def _expand(server: str, key: str, value: str, environ: Mapping[str, str]) -> str:
+    try:
+        parts = parse_template(value)
+    except ValueError as error:  # pragma: no cover - the model already validated the syntax
+        raise ConfigError(f"Server {server}: {key} {error}.") from None
+    missing = [part.name for part in parts if isinstance(part, VariableReference) and part.name not in environ]
+    if missing:
+        names = ", ".join(dict.fromkeys(missing))
+        one = len(set(missing)) == 1
+        raise ConfigError(
+            f"Server {server}: {key} uses the environment {'variable' if one else 'variables'} {names}, "
+            f"which {'is' if one else 'are'} not set."
+        )
+    return _join(parts, environ)
+
+
+def _join(parts: list[str | VariableReference], environ: Mapping[str, str]) -> str:
+    return "".join(environ[part.name] if isinstance(part, VariableReference) else part for part in parts)
 
 
 @dataclass(frozen=True)

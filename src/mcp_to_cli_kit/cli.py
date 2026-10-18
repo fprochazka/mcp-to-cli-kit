@@ -26,8 +26,9 @@ from typing import Any, NoReturn
 import click
 from mcp import types
 
+from mcp_to_cli_kit import redaction
 from mcp_to_cli_kit.arguments import CompiledTool, compile_tool, kebab_case
-from mcp_to_cli_kit.cache import SchemaCache, default_cache_dir
+from mcp_to_cli_kit.cache import CachedTools, SchemaCache, default_cache_dir
 from mcp_to_cli_kit.client import (
     DEFAULT_RETRY_DELAYS,
     KIT_DISTRIBUTION,
@@ -50,6 +51,7 @@ from mcp_to_cli_kit.config import (
     load_config,
 )
 from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
+from mcp_to_cli_kit.redaction import RedactingFilter
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,13 @@ class ConfigFailure(click.ClickException):
     """The configuration is missing or invalid. Printed as one ``Error:`` line."""
 
     exit_code = EXIT_USAGE
+
+
+class UnresolvedServer(ConfigFailure):
+    """A server cannot be contacted because an environment variable its config refers to is not set.
+
+    Like a transport failure, it only affects the commands that need that server.
+    """
 
 
 class TransportFailure(click.ClickException):
@@ -306,6 +315,7 @@ class TopLevelListing:
     tools: dict[str, ToolEntry] = field(default_factory=dict)
     groups: dict[str, str] = field(default_factory=dict)
     unavailable: dict[str, str] = field(default_factory=dict)
+    unresolved: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -337,13 +347,14 @@ class Runtime:
         for client in self.clients.values():
             client.close()
         self.portal.__exit__(None, None, None)
+        # The expanded secrets of this invocation; a later one in the same process registers its own.
+        redaction.clear()
 
     def tools(self, server: str) -> list[dict[str, Any]]:
         """The tools of a server: from a fresh cache, else from the server, else from an expired cache."""
         if server in self._tools:
             return self._tools[server]
-        client = self.clients[server]
-        cached = self.cache.load(server, client.server.url)
+        cached = self._load_cache(server)
         if cached is not None and cached.fresh and not self.refresh:
             logger.debug("Using the cached tool list of %s", server)
             self._tools[server] = cached.tools
@@ -355,8 +366,10 @@ class Runtime:
         self._live.add(server)
         try:
             tools = client.list_tools()
-        except (TransportError, ServerRejectedError) as error:
+        except (TransportError, ServerRejectedError, ConfigError) as error:
             if fallback is None:
+                if isinstance(error, ConfigError):
+                    raise UnresolvedServer(str(error)) from error
                 raise TransportFailure(f"cannot list the tools of {client.display_url} ({server}): {error}") from error
             click.echo(
                 f"{self.app.bin_name}: warning: cannot refresh the tool list of {server} ({error}); "
@@ -365,9 +378,13 @@ class Runtime:
             )
             self._tools[server] = fallback
             return fallback
-        self.cache.save(server, client.server.url, tools)
+        self.cache.save(server, client.server.url, tools, client.cache_url())
         self._tools[server] = tools
         return tools
+
+    def _load_cache(self, server: str) -> CachedTools | None:
+        client = self.clients[server]
+        return self.cache.load(server, client.server.url, client.cache_url())
 
     def server_tools(self, server: str) -> ServerTools:
         """A server's tools by their command name within the server, without any mount prefix."""
@@ -402,7 +419,7 @@ class Runtime:
         logger.debug("No command %r in the cached tool list of %s; fetching it again", name, server)
         self._tools.pop(server, None)
         self._indexes.pop(server, None)
-        cached = self.cache.load(server, self.clients[server].server.url)
+        cached = self._load_cache(server)
         self._fetch(server, fallback=cached.tools if cached is not None else None)
         return lookup()
 
@@ -450,7 +467,7 @@ class Runtime:
             return self.server_tools(server)
         if fresh_only and self.refresh:
             return None
-        cached = self.cache.load(server, self.clients[server].server.url)
+        cached = self._load_cache(server)
         if cached is None or (fresh_only and not cached.fresh):
             return None
         index = self._index(server, cached.tools)
@@ -491,13 +508,13 @@ class Runtime:
                 found[server] = replace(entry, command=prefix + entry.command)
 
         to_ask = unknown if found else candidates
-        unchecked: list[tuple[str, TransportFailure]] = []
+        unchecked: list[tuple[str, TransportFailure | UnresolvedServer]] = []
         for server, prefix in to_ask:
             if server in found:
                 continue
             try:
                 entry = self.find_in_server(server, name[len(prefix) :])
-            except TransportFailure as error:
+            except (TransportFailure, UnresolvedServer) as error:
                 unchecked.append((server, error))
                 continue
             if entry is not None:
@@ -514,7 +531,10 @@ class Runtime:
                 )
             return next(iter(found.values()))
         if unchecked:
-            raise TransportFailure("\n".join(failure.format_message() for _, failure in unchecked))
+            message = "\n".join(failure.format_message() for _, failure in unchecked)
+            if any(isinstance(failure, UnresolvedServer) for _, failure in unchecked):
+                raise ConfigFailure(message)
+            raise TransportFailure(message)
         return None
 
     def check_group_name(self, group: str, server: str) -> None:
@@ -549,8 +569,10 @@ class Runtime:
         for server, prefix in self.top_level_servers():
             try:
                 tools = self.server_tools(server)
-            except TransportFailure as error:
+            except (TransportFailure, UnresolvedServer) as error:
                 listing.unavailable[server] = error.format_message()
+                if isinstance(error, UnresolvedServer):
+                    listing.unresolved.add(server)
                 continue
             for command, entry in tools.entries.items():
                 full = prefix + command
@@ -606,6 +628,8 @@ def configure_logging(verbosity: int) -> None:
     """``-v`` shows the kit's debug messages, ``-vv`` also the MCP SDK's and httpx's. All on stderr."""
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    # Expanded ${NAME} values and the URL's userinfo and query never reach the log, -vv included.
+    handler.addFilter(RedactingFilter())
 
     kit = logging.getLogger("mcp_to_cli_kit")
     kit.handlers = [handler]
@@ -625,6 +649,7 @@ def configure_logging(verbosity: int) -> None:
         root.removeHandler(existing)
     root_handler: logging.Handler = logging.StreamHandler(sys.stderr) if verbosity >= 1 else logging.NullHandler()
     root_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    root_handler.addFilter(RedactingFilter())
     root_handler.setLevel(logging.WARNING)
     setattr(root_handler, _KIT_HANDLER, True)
     root.addHandler(root_handler)
@@ -816,7 +841,8 @@ class KitGroup(click.Group):
         listing = runtime.top_level_listing()
         if listing.unavailable and not listing.tools and not listing.groups:
             # Nothing at all to show: the failures are the answer, as an error.
-            raise TransportFailure("\n".join(listing.unavailable.values()))
+            message = "\n".join(listing.unavailable.values())
+            raise ConfigFailure(message) if listing.unresolved else TransportFailure(message)
         return listing
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
@@ -1034,6 +1060,8 @@ class ToolCommand(click.Command):
         logger.debug("Calling %s on %s with %s", self.entry.name, self.entry.server, arguments)
         try:
             result = client.call_tool(self.entry.name, arguments)
+        except ConfigError as error:
+            raise ConfigFailure(str(error)) from error
         except TransportError as error:
             raise TransportFailure(str(error)) from error
         except ServerRejectedError as error:

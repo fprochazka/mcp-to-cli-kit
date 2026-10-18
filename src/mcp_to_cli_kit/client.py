@@ -38,7 +38,8 @@ from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
-from mcp_to_cli_kit.config import ServerConfig
+from mcp_to_cli_kit import redaction
+from mcp_to_cli_kit.config import ResolvedServer, ServerConfig, expand_server, expand_url
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +98,13 @@ class ServerRejectedError(Exception):
 
 
 def redact_url(url: str) -> str:
-    """Strip the userinfo, query and fragment, which may carry secrets, from a URL."""
+    """Strip the userinfo, query and fragment, which may carry secrets, from a URL.
+
+    Works on URL templates too: a ``${NAME}`` in the host or path is kept as written.
+    """
     try:
         parts = urlsplit(url)
-        host = parts.hostname or ""
-        if parts.port is not None:
-            host = f"{host}:{parts.port}"
+        host = parts.netloc.rpartition("@")[2]
         return urlunsplit((parts.scheme, host, parts.path, "", ""))
     except ValueError:
         return "<invalid URL>"
@@ -340,20 +342,36 @@ class ServerClient:
         self.server = server
         # Sent in initialize as clientInfo; without it the SDK announces itself as "mcp".
         self._client_info = client_info
-        self._headers = {CLIENT_HEADER: client_header, **server.headers}
+        self._client_header = client_header
         self._portal = portal
         self._retry_delays = retry_delays
         self._session: _Session | None = None
+        self._resolved: ResolvedServer | None = None
 
     @property
     def display_url(self) -> str:
-        """The server URL without the parts that may carry secrets."""
+        """The configured URL without the parts that may carry secrets, its ``${NAME}`` references unexpanded."""
         return redact_url(self.server.url)
+
+    def resolve(self) -> ResolvedServer:
+        """The URL and headers with their environment variables expanded, at the first request.
+
+        Raises:
+            ConfigError: A variable is not set, or the expanded URL is not an http(s) URL.
+        """
+        if self._resolved is None:
+            self._resolved = expand_server(self.name, self.server)
+        return self._resolved
+
+    def cache_url(self) -> str | None:
+        """The expanded URL that tells cache entries apart, or None when one of its variables is not set."""
+        return self._resolved.url if self._resolved is not None else expand_url(self.server)
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Fetch every page of ``tools/list``, retrying on connect errors, timeouts and 502/503/504.
 
         Raises:
+            ConfigError: The server's config cannot be expanded; see ``resolve``.
             TransportError: The server could not be reached, after the retries.
             ServerRejectedError: The server answered with a JSON-RPC error.
         """
@@ -377,6 +395,7 @@ class ServerClient:
         """Send ``tools/call``. It is retried only when the call itself provably never reached the server.
 
         Raises:
+            ConfigError: The server's config cannot be expanded; see ``resolve``.
             TransportError: The server could not be reached, after the retries.
             ServerRejectedError: The server answered with a JSON-RPC error.
         """
@@ -432,19 +451,28 @@ class ServerClient:
         if self._session is None or not self._session.usable:
             if self._session is not None:
                 self._session.close()
+            resolved = self.resolve()
             logger.debug("Opening an MCP session with %s (%s)", self.name, self.display_url)
-            self._session = _Session(self._portal(), self.server.url, self.server, self._headers, self._client_info)
+            headers = {CLIENT_HEADER: self._client_header, **resolved.headers}
+            self._session = _Session(self._portal(), resolved.url, self.server, headers, self._client_info)
         session = self._session
         try:
-            return session.run(operation)
-        except McpError as error:
-            raise self._describe_mcp_error(error, session.trace, session.transport_failure) from error
-        except TransportError:
-            raise
-        except BaseException as error:
-            if isinstance(error, KeyboardInterrupt | SystemExit):
+            try:
+                return session.run(operation)
+            except McpError as error:
+                raise self._describe_mcp_error(error, session.trace, session.transport_failure) from error
+            except TransportError:
                 raise
-            raise describe_failure(error, self.display_url, session.trace) from error
+            except BaseException as error:
+                if isinstance(error, KeyboardInterrupt | SystemExit):
+                    raise
+                raise describe_failure(error, self.display_url, session.trace) from error
+        except TransportError as error:
+            # Defense in depth: a message built from an exception may quote an expanded value. The
+            # original is dropped from the chain (from None), so no traceback can show it either.
+            raise TransportError(redaction.redact(str(error)), error.kind, error.status) from None
+        except ServerRejectedError as error:
+            raise ServerRejectedError(redaction.redact(str(error)), error.code) from None
 
     def _describe_mcp_error(
         self, error: McpError, trace: _HttpTrace, session_failure: Exception | None = None
