@@ -71,8 +71,9 @@ SERVER_NAME_PATTERN = r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$"
 
 COMMAND_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 
-# Commands the kit adds at every level where tools live; no group may take these names.
-BUILTIN_COMMANDS = frozenset({"schema"})
+# Names the kit reserves for its own commands: "schema" at every level where tools live, "config"
+# at the top level. No group may take them, and a tool that would is renamed with a "-tool" suffix.
+BUILTIN_COMMANDS = frozenset({"schema", "config"})
 
 
 def _not_builtin(name: str) -> str:
@@ -402,6 +403,7 @@ class LoadedConfig:
         path: The config file that was looked for.
         file_loaded: Whether that file existed and was read.
         env_prefix: The prefix of the environment variables that were applied.
+        env_applied: The names of the environment variables that were applied, sorted.
     """
 
     bin_name: str
@@ -409,6 +411,7 @@ class LoadedConfig:
     path: Path
     file_loaded: bool
     env_prefix: str
+    env_applied: tuple[str, ...] = ()
 
 
 def default_config_path(bin_name: str) -> Path:
@@ -478,7 +481,8 @@ def load_config(
             + yaml.safe_dump({"servers": {"example": {"url": "https://mcp.example.com/mcp"}}}, sort_keys=False)
         )
 
-    merged = _merge_config(merged, _read_env(environ, prefix, merged))
+    applied: list[str] = []
+    merged = _merge_config(merged, _read_env(environ, prefix, merged, applied))
 
     try:
         config = CliConfig.model_validate(merged)
@@ -489,7 +493,14 @@ def load_config(
         sources.append(f"{prefix}* environment variables")
         raise ConfigError(f"Invalid configuration (from {', '.join(sources)}):\n{_format_errors(error)}") from error
 
-    return LoadedConfig(bin_name=bin_name, config=config, path=path, file_loaded=file_loaded, env_prefix=prefix)
+    return LoadedConfig(
+        bin_name=bin_name,
+        config=config,
+        path=path,
+        file_loaded=file_loaded,
+        env_prefix=prefix,
+        env_applied=tuple(sorted(applied)),
+    )
 
 
 def save_config(path: str | os.PathLike[str], data: Mapping[str, Any] | CliConfig) -> Path:
@@ -601,8 +612,14 @@ _SERVER_FIELDS = {_env_key(name): name for name in ServerConfig.model_fields}
 _JSON_FIELDS = {"headers", "mount", "strip_prefixes", "tool_groups", "hidden_tools"}
 
 
-def _read_env(environ: Mapping[str, str], prefix: str, merged: Mapping[str, Any]) -> dict[str, Any]:
-    """Turn the ``<PREFIX>*`` variables into a config layer, matched against the layers below."""
+def _read_env(
+    environ: Mapping[str, str], prefix: str, merged: Mapping[str, Any], applied: list[str] | None = None
+) -> dict[str, Any]:
+    """Turn the ``<PREFIX>*`` variables into a config layer, matched against the layers below.
+
+    The names of the variables that were used are appended to ``applied``.
+    """
+    applied = [] if applied is None else applied
     servers_below: Mapping[str, Any] = merged.get("servers") or {}
     if not isinstance(servers_below, Mapping):
         servers_below = {}
@@ -618,6 +635,7 @@ def _read_env(environ: Mapping[str, str], prefix: str, merged: Mapping[str, Any]
 
         if parts == ["HELP"]:
             layer["help"] = value
+            applied.append(variable)
             continue
 
         if parts[0] == "SERVERS" and len(parts) >= 3:
@@ -633,6 +651,7 @@ def _read_env(environ: Mapping[str, str], prefix: str, merged: Mapping[str, Any]
         server_below = servers_below.get(server)
         server_layer = layer.setdefault("servers", {}).setdefault(server, {})
         _set_server_field(variable, server_layer, field_path, value, server_below)
+        applied.append(variable)
 
     return layer
 

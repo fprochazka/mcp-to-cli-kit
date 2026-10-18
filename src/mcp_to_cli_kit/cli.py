@@ -26,7 +26,7 @@ from typing import Any, NoReturn
 import click
 from mcp import types
 
-from mcp_to_cli_kit import redaction
+from mcp_to_cli_kit import config_view, redaction
 from mcp_to_cli_kit.arguments import CompiledTool, compile_tool, kebab_case
 from mcp_to_cli_kit.cache import CachedTools, SchemaCache, default_cache_dir
 from mcp_to_cli_kit.client import (
@@ -156,7 +156,8 @@ class ToolIndex:
     def add(self, server: str, local_name: str, tool: dict[str, Any], aliases: tuple[str, ...]) -> str | None:
         """Add a tool under the kebab case of ``local_name``; returns the command name, None when it is taken.
 
-        A tool whose command would be a built-in command (``schema``) gets a ``-tool`` suffix.
+        A tool whose command would be a built-in command (``schema`` or ``config``) gets a ``-tool``
+        suffix, at every level.
         """
         command = kebab_case(local_name)
         if command in BUILTIN_COMMANDS:
@@ -834,7 +835,7 @@ class KitGroup(click.Group):
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         listing = self._listing(ctx)
-        return sorted([*listing.tools, *listing.groups, *BUILTIN_COMMANDS])
+        return sorted([*listing.tools, *listing.groups, *BUILTIN_COMMANDS])  # schema and config
 
     def _listing(self, ctx: click.Context) -> TopLevelListing:
         runtime = _runtime(ctx)
@@ -848,6 +849,8 @@ class KitGroup(click.Group):
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         if cmd_name == SchemaCommand.NAME:
             return SchemaCommand()
+        if cmd_name == ConfigCommand.NAME:
+            return ConfigCommand()
         runtime = _runtime(ctx)
         groups = runtime.group_mounts()
         if cmd_name in groups:
@@ -876,7 +879,7 @@ class KitGroup(click.Group):
         if rows:
             with formatter.section("Tools"):
                 formatter.write_dl(rows)
-        _write_builtins(formatter)
+        _write_builtins(formatter, top_level=True)
         if listing.unavailable:
             with formatter.section("Unavailable servers"):
                 formatter.write_dl(sorted(listing.unavailable.items()))
@@ -892,7 +895,7 @@ class MountGroup(click.Group):
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         tools = _runtime(ctx).server_tools(self.server)
-        return sorted([*tools.entries, *tools.groups, *BUILTIN_COMMANDS])
+        return sorted([*tools.entries, *tools.groups, SchemaCommand.NAME])
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         if cmd_name == SchemaCommand.NAME:
@@ -934,7 +937,7 @@ class ToolGroupCommand(click.Group):
         self.tool_group = tool_group.group
 
     def list_commands(self, ctx: click.Context) -> list[str]:
-        return sorted([*_runtime(ctx).server_tools(self.server).groups[self.tool_group].entries, *BUILTIN_COMMANDS])
+        return sorted([*_runtime(ctx).server_tools(self.server).groups[self.tool_group].entries, SchemaCommand.NAME])
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
         if cmd_name == SchemaCommand.NAME:
@@ -993,9 +996,12 @@ class SchemaCommand(click.Command):
         _write(json.dumps(schema, ensure_ascii=False, indent=indent) + "\n", "stdout")
 
 
-def _write_builtins(formatter: click.HelpFormatter) -> None:
+def _write_builtins(formatter: click.HelpFormatter, *, top_level: bool = False) -> None:
+    rows = [(SchemaCommand.NAME, SchemaCommand.HELP)]
+    if top_level:
+        rows.append((ConfigCommand.NAME, ConfigCommand.HELP))
     with formatter.section("Commands"):
-        formatter.write_dl([(SchemaCommand.NAME, SchemaCommand.HELP)])
+        formatter.write_dl(sorted(rows))
 
 
 def _write_tools(formatter: click.HelpFormatter, entries: Mapping[str, ToolEntry]) -> None:
@@ -1015,6 +1021,42 @@ def _resolve_with_hint(
         hint = f" Did you mean {', '.join(close)}?" if close else f" Run '{help_path} --help' for the list."
         ctx.fail(f"No such command {name!r}.{hint}")
     return command.name if command is not None else None, command, args[1:]
+
+
+class ConfigCommand(click.Command):
+    """``config``: print the effective configuration and where it came from, with secrets masked.
+
+    It reads the configuration only: no tool list, no cache and no request, so it also works
+    offline and with unset ``${NAME}`` variables, which it shows unexpanded.
+    """
+
+    NAME = "config"
+    HELP = "Print the effective configuration as JSON, with secrets masked."
+
+    def __init__(self) -> None:
+        super().__init__(
+            name=self.NAME,
+            help=(
+                f"{self.HELP} Also shows the config file, whether it was loaded, the environment "
+                "variable prefix and the names of the environment variables that were applied. "
+                "${NAME} references are shown unexpanded. Nothing is sent to any server."
+            ),
+            params=[*_mode_options()],
+        )
+
+    def invoke(self, ctx: click.Context) -> None:
+        root = ctx.find_root()
+        group = root.command
+        assert isinstance(group, KitGroup)
+        try:
+            loaded = load_config(
+                group.app.bin_name, default=group.app.default_config, config_path=root.params.get("config")
+            )
+        except ConfigError as error:
+            raise ConfigFailure(str(error)) from error
+        mode = resolve_mode(*_modes(ctx))
+        indent = 2 if mode == "pretty" else None
+        _write(json.dumps(config_view.describe(loaded), ensure_ascii=False, indent=indent) + "\n", "stdout")
 
 
 class ToolCommand(click.Command):

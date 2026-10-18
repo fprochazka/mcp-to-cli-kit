@@ -215,6 +215,31 @@ A property named like a built-in option (`help`, `input-json`, `arg-file`, `json
 
 `schema` is a built-in command name: a tool whose command would be `schema` is renamed to `schema-tool`, and no group mount or tool group may be called `schema`.
 
+### The config command
+
+`example-tool config` prints the effective configuration as JSON: the code default, the config file and the environment variables merged, with every default filled in. Next to it, it shows the config file that was looked for (`config_file`), whether it was loaded (`config_file_loaded`), the environment variable prefix (`env_prefix`) and the names of the environment variables that were applied (`env_applied`), never their values.
+
+```console
+$ example-tool config --pretty
+{
+  "config_file": "/home/me/.config/example-tool/config.yaml",
+  "config_file_loaded": true,
+  "env_prefix": "EXAMPLE_TOOL_",
+  "env_applied": ["EXAMPLE_TOOL_SERVERS__EXAMPLE__TIMEOUT"],
+  "config": {"help": null, "servers": {"example": {"url": "https://mcp.example.com/mcp", "headers": {"Authorization": "Bearer ${EXAMPLE_TOKEN}"}, ...}}}
+}
+```
+
+- It reads the configuration only. It loads no tool list, sends nothing to any server and needs no cache, so it works offline and with unset variables.
+- `${NAME}` references are shown as written, never expanded.
+- Literal text that may be a secret is masked as `***` plus its last 4 characters, or only `***` when it is shorter than 12 characters. These are masked:
+  - every header value, except `Accept`, `Content-Type`, `User-Agent` and `X-Mcp-Client` (matched in any case), which are shown as written. A leading `Bearer`, `Basic`, `Token`, `Digest`, `Bot` or `ApiKey` followed by more text stays readable, as in `Bearer ***abcd`;
+  - a URL's whole userinfo (user and password), its query values and its fragment.
+- Shown as written: the URL's scheme, host, port and path, every other setting (timeouts, mounts, tool groups, hidden tools, prefixes, help texts), and all `${NAME}` references.
+- The output follows the usual modes: compact under an AI agent or with `--json`, indented otherwise or with `--pretty`.
+
+`config` is a reserved command name, like `schema`: a tool whose command would be `config` is renamed to `config-tool`, and no group mount or tool group may be called `config`.
+
 ### Output and exit codes
 
 Under an AI coding agent (detected from its environment variables), or with `--json`, the result is printed exactly as the server sent it. Otherwise, or with `--pretty`, JSON is indented with `indent=2` and non-ASCII text stays readable. Several content items become one JSON array. Nothing is ever wrapped to the terminal width.
