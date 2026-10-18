@@ -1,6 +1,6 @@
 [project]
 name = "mcp-to-cli-kit"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Build a typed command-line interface for one or more remote MCP servers"
 readme = "README.md"
 license = "MIT"
@@ -37,8 +37,11 @@ Repository = "https://github.com/fprochazka/mcp-to-cli-kit"
 Issues = "https://github.com/fprochazka/mcp-to-cli-kit/issues"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcp_to_cli_kit"]

@@ -4,7 +4,13 @@ A small library for turning one or more remote MCP servers into a typed command-
 
 The kit owns the parts every such CLI needs and tends to get wrong when it is copied from project to project: the mapping from JSON schema to options, the configuration loading, the schema cache, and output that stays valid JSON when piped. A consumer package only supplies its bin name and a default configuration.
 
-The kit is under development and not published yet.
+## Installation
+
+Add the kit to the consumer package:
+
+```bash
+uv add mcp-to-cli-kit
+```
 
 ## Building a consumer package
 
@@ -69,9 +75,9 @@ def main() -> None:
     kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool", result_classifier=is_error)
 ```
 
-### Installing during development
+### Developing the kit and a consumer together
 
-The kit is not on PyPI yet. Point the consumer at a local checkout of the kit as an editable path dependency, then install the consumer as a uv tool:
+To change the kit and a consumer at the same time, point the consumer at a local checkout of the kit as an editable path dependency, then install the consumer as a uv tool:
 
 ```toml
 [tool.uv.sources]
@@ -81,10 +87,10 @@ mcp-to-cli-kit = { path = "../mcp-to-cli-kit", editable = true }
 ```console
 $ uv tool install -e .
 $ example-tool --version
-example-tool 0.1.0 (mcp-to-cli-kit 0.1.0)
+example-tool 0.1.0 (mcp-to-cli-kit 0.1.dev7+g1d1eb86b6)
 ```
 
-Because both installs are editable, a change in the kit or in the consumer takes effect without reinstalling.
+Because both installs are editable, a change in the kit or in the consumer takes effect without reinstalling. The kit takes its version from git tags, so a checkout between releases reports a development version such as `0.1.dev7+g1d1eb86b6`; the editable install records it when it is installed, so run `uv tool install -e .` again to refresh it.
 
 ## Usage
 
