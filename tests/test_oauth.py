@@ -509,6 +509,21 @@ class TestStatusAndLogout:
         assert entry["signed_in_until"] is None
         assert_no_secrets(after, protected_server)
 
+    def test_status_prints_one_line_and_full_status_indented(self, run: Run) -> None:
+        sign_in(run)
+        # The same for a person and for an AI agent, unless a flag says otherwise.
+        for env in (None, {"CLAUDECODE": "1"}):
+            short = run(["auth", "status"], env=env)
+            full = run(["auth", "status", "--full"], env=env)
+            assert short.exit_code == 0 and full.exit_code == 0
+            assert short.stdout.count("\n") == 1
+            assert full.stdout.startswith('{\n  "servers"') and json.loads(full.stdout) == json.loads(
+                run(["auth", "status", "--full", "--json"]).stdout
+            )
+
+        assert run(["auth", "status", "--pretty"]).stdout.startswith('{\n  "servers"')
+        assert run(["auth", "status", "--full", "--json"]).stdout.count("\n") == 1
+
     def test_full_status(self, run: Run, protected_server: ProtectedServer) -> None:
         before = run(["auth", "status", "--full", "--json"])
         assert before.exit_code == 4

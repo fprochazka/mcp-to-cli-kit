@@ -1169,8 +1169,9 @@ class AuthGroup(click.Group):
                 help=(
                     "Print the sign-in state of each server that uses OAuth as JSON, without the tokens: who is "
                     "signed in, since when, and until when. signed_in_until is null when the authorization server "
-                    "did not say how long its refresh token lasts. Nothing is sent to any server. Exits 4 when a "
-                    "server is not signed in."
+                    "did not say how long its refresh token lasts. Prints one line, or indented JSON with --full, "
+                    "unless --json or --pretty says otherwise. Nothing is sent to any server. Exits 4 when a server "
+                    "is not signed in."
                 ),
                 params=[
                     click.Argument(["server"], required=False, metavar="[SERVER]"),
@@ -1286,7 +1287,8 @@ def _status(server: str | None, full: bool, machine_output: bool, pretty_output:
                 "token_file": str(runtime.tokens.path(name)),
             }
         servers.append(entry)
-    mode = resolve_mode(*_modes(ctx))
+    # The short status fits one line for a person too; the full one is long enough to read only indented.
+    mode = resolve_mode(*_modes(ctx), "pretty" if full else "machine")
     _write(json.dumps({"servers": servers}, indent=2 if mode == "pretty" else None) + "\n", "stdout")
     if not all(entry["signed_in"] for entry in servers):
         ctx.exit(EXIT_AUTH)
