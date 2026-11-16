@@ -1167,10 +1167,20 @@ class AuthGroup(click.Group):
                 "status",
                 callback=_status,
                 help=(
-                    "Print the sign-in state of each server that uses OAuth as JSON, without the tokens. Nothing is "
-                    "sent to any server. Exits 4 when a server is not signed in."
+                    "Print the sign-in state of each server that uses OAuth as JSON, without the tokens: who is "
+                    "signed in, since when, and until when. signed_in_until is null when the authorization server "
+                    "did not say how long its refresh token lasts. Nothing is sent to any server. Exits 4 when a "
+                    "server is not signed in."
                 ),
-                params=[click.Argument(["server"], required=False, metavar="[SERVER]"), *_mode_options()],
+                params=[
+                    click.Argument(["server"], required=False, metavar="[SERVER]"),
+                    click.Option(
+                        ["--full"],
+                        is_flag=True,
+                        help="Also print when each token expires, the scopes, the client, the issuer, the token file.",
+                    ),
+                    *_mode_options(),
+                ],
             )
         )
 
@@ -1244,7 +1254,7 @@ def _logout(server: str | None, revoke: bool) -> None:
         click.echo(f"Signed out of {name}.", err=True)
 
 
-def _status(server: str | None, machine_output: bool, pretty_output: bool) -> None:
+def _status(server: str | None, full: bool, machine_output: bool, pretty_output: bool) -> None:
     ctx = click.get_current_context()
     runtime, names = _oauth_targets(server)
     servers = []
@@ -1254,27 +1264,36 @@ def _status(server: str | None, machine_output: bool, pretty_output: bool) -> No
         kind = resolved.auth.config.bearer
         stored = runtime.tokens.load(name)
         tokens = stored if stored is not None and stored.is_for(resolved.url, resolved.auth) else None
-        expiry = tokens.expiry(kind) if tokens is not None else None
-        servers.append(
-            {
-                "server": name,
-                "signed_in": tokens is not None and (tokens.is_fresh(kind) or tokens.refresh_token is not None),
-                "identity": tokens.identity if tokens is not None else None,
+        entry: dict[str, Any] = {
+            "server": name,
+            "signed_in": tokens is not None and tokens.is_signed_in(kind),
+            "identity": tokens.identity if tokens is not None else None,
+            "signed_in_at": _iso_time(tokens.signed_in_at) if tokens is not None else None,
+            "signed_in_until": _iso_time(tokens.signed_in_until(kind)) if tokens is not None else None,
+        }
+        if full:
+            entry |= {
                 "bearer": kind,
-                "expires_at": _iso_time(expiry) if expiry is not None else None,
-                "refreshable": tokens is not None and tokens.refresh_token is not None,
+                "access_token_expires_at": _iso_time(tokens.expires_at) if tokens is not None else None,
+                "id_token_expires_at": _iso_time(tokens.id_token_expires_at) if tokens is not None else None,
+                "has_refresh_token": tokens is not None and tokens.refresh_token is not None,
+                "refresh_token_expires_at": _iso_time(tokens.refresh_expires_at) if tokens is not None else None,
+                "obtained_at": _iso_time(tokens.obtained_at) if tokens is not None else None,
                 "scopes": tokens.scope.split() if tokens is not None and tokens.scope else [],
+                "client_id": resolved.auth.client_id,
+                "issuer": tokens.issuer if tokens is not None else resolved.auth.config.authorization_server,
+                "resource": tokens.resource if tokens is not None else None,
                 "token_file": str(runtime.tokens.path(name)),
             }
-        )
+        servers.append(entry)
     mode = resolve_mode(*_modes(ctx))
     _write(json.dumps({"servers": servers}, indent=2 if mode == "pretty" else None) + "\n", "stdout")
     if not all(entry["signed_in"] for entry in servers):
         ctx.exit(EXIT_AUTH)
 
 
-def _iso_time(epoch: float) -> str:
-    return datetime.fromtimestamp(epoch, tz=UTC).isoformat(timespec="seconds")
+def _iso_time(epoch: float | None) -> str | None:
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat(timespec="seconds") if epoch is not None else None
 
 
 class ToolCommand(click.Command):

@@ -37,7 +37,7 @@ import threading
 import time
 import webbrowser
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Literal
@@ -64,6 +64,8 @@ LOCK_TIMEOUT_SECONDS = 30.0
 
 CALLBACK_PATH = "/callback"
 
+# The token file format. A field that an older version can do without is added without a new version;
+# the version changes only when an older version would misread the file.
 _FORMAT_VERSION = 1
 
 Bearer = Literal["access_token", "id_token"]
@@ -142,7 +144,13 @@ class StoredTokens:
         server_url_sha256: The hash of the expanded server URL the tokens were issued for.
         expires_at: When the access token expires, in seconds since the epoch; None when unknown.
         id_token_expires_at: When the ID token expires, from its ``exp`` claim.
+        obtained_at: When the last token response came, at the sign-in or a refresh.
         identity: The ``email`` claim of the ID token, to tell the user who is signed in.
+        refresh_expires_at: When the refresh token expires, from the non-standard
+            ``refresh_token_expires_in`` (Google) or ``refresh_expires_in`` (Keycloak) of the token
+            response; None when the response did not say, or there is no refresh token.
+        signed_in_at: When the user signed in through the browser; refreshes keep it. None for
+            tokens stored before the field existed.
     """
 
     server_url_sha256: str
@@ -159,6 +167,8 @@ class StoredTokens:
     id_token_expires_at: float | None
     obtained_at: float
     identity: str | None
+    refresh_expires_at: float | None = None
+    signed_in_at: float | None = None
     version: int = field(default=_FORMAT_VERSION)
 
     def bearer(self, kind: Bearer) -> str | None:
@@ -177,6 +187,26 @@ class StoredTokens:
         now = time.time() if now is None else now
         return expiry is None or expiry - now > REFRESH_MARGIN_SECONDS
 
+    def is_signed_in(self, kind: Bearer, now: float | None = None) -> bool:
+        """Whether a command can get a bearer without a new sign-in: it is fresh, or a refresh token is left to get one.
+
+        A refresh token counts until its known expiry. The authorization server can still end it
+        earlier, which only the next refresh finds out.
+        """
+        now = time.time() if now is None else now
+        if self.is_fresh(kind, now):
+            return True
+        return self.refresh_token is not None and (self.refresh_expires_at is None or self.refresh_expires_at > now)
+
+    def signed_in_until(self, kind: Bearer) -> float | None:
+        """When the sign-in ends unless the user signs in again.
+
+        With a refresh token it is the refresh token's expiry, None when the authorization server
+        did not say: then the sign-in lasts until the server ends it, for example after a
+        revocation or a long time unused. Without a refresh token it is the bearer's expiry.
+        """
+        return self.refresh_expires_at if self.refresh_token is not None else self.expiry(kind)
+
     def is_for(self, url: str, auth: ResolvedOAuth) -> bool:
         """Whether the tokens were issued for this server URL, client and, when configured, issuer."""
         issuer = auth.config.authorization_server
@@ -191,6 +221,9 @@ class StoredTokens:
         for token in (self.access_token, self.id_token, self.refresh_token):
             if token:
                 redaction.register(token, "***")
+
+
+_FIELDS = frozenset(item.name for item in fields(StoredTokens))
 
 
 def url_hash(url: str) -> str:
@@ -220,7 +253,8 @@ class TokenStore:
         try:
             if not isinstance(content, dict) or content.get("version") != _FORMAT_VERSION:
                 raise TypeError("unknown format")
-            tokens = StoredTokens(**content)
+            # Fields a later version added are left out, so going back to an older version keeps the sign-in.
+            tokens = StoredTokens(**{key: value for key, value in content.items() if key in _FIELDS})
             if not isinstance(tokens.access_token, str) or not isinstance(tokens.token_endpoint, str):
                 raise TypeError("missing fields")
         except TypeError as error:
@@ -664,16 +698,27 @@ def _tokens_from_response(payload: dict[str, Any], base: StoredTokens, previous:
     """The tokens a token response carries, on top of what ``base`` says they are for.
 
     A refresh response without a refresh token keeps the previous one; one with a new refresh
-    token replaces it, as an authorization server that rotates them expects.
+    token replaces it, as an authorization server that rotates them expects. The refresh token's
+    expiry follows the same rule: a response that does not state it keeps the previous one only
+    with the previous refresh token, as a new refresh token may have a lifetime of its own.
+    ``signed_in_at`` is now at the sign-in and the previous one on a refresh.
     """
     now = time.time()
-    expires_in = payload.get("expires_in")
+    expires_in = _positive_seconds(payload.get("expires_in"))
+    refresh_expires_in = _positive_seconds(payload.get("refresh_token_expires_in", payload.get("refresh_expires_in")))
     id_token = payload.get("id_token") if isinstance(payload.get("id_token"), str) else None
     claims = _jwt_claims(id_token) if id_token else {}
     exp = claims.get("exp")
     email = claims.get("email")
     refresh = payload.get("refresh_token")
     scope = payload.get("scope")
+    refresh_token = refresh if isinstance(refresh, str) else previous.refresh_token if previous else None
+    if refresh_expires_in is not None:
+        refresh_expires_at: float | None = now + refresh_expires_in
+    elif previous is not None and refresh_token is not None and refresh_token == previous.refresh_token:
+        refresh_expires_at = previous.refresh_expires_at
+    else:
+        refresh_expires_at = None
     tokens = StoredTokens(
         server_url_sha256=base.server_url_sha256,
         issuer=base.issuer,
@@ -684,14 +729,26 @@ def _tokens_from_response(payload: dict[str, Any], base: StoredTokens, previous:
         scope=scope if isinstance(scope, str) else base.scope,
         access_token=payload["access_token"],
         id_token=id_token,
-        refresh_token=refresh if isinstance(refresh, str) else previous.refresh_token if previous else None,
-        expires_at=now + expires_in if isinstance(expires_in, int | float) and expires_in > 0 else None,
+        refresh_token=refresh_token,
+        expires_at=now + expires_in if expires_in is not None else None,
         id_token_expires_at=float(exp) if isinstance(exp, int | float) else None,
         obtained_at=now,
         identity=email if isinstance(email, str) else previous.identity if previous else None,
+        refresh_expires_at=refresh_expires_at if refresh_token is not None else None,
+        signed_in_at=previous.signed_in_at if previous is not None else now,
     )
     tokens.register_secrets()
     return tokens
+
+
+def _positive_seconds(value: Any) -> float | None:
+    """A lifetime in seconds from a token response; None when absent, not a number, or not positive.
+
+    Keycloak sends ``refresh_expires_in: 0`` for an offline token that does not expire.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        return None
+    return float(value)
 
 
 def _jwt_claims(token: str) -> dict[str, Any]:

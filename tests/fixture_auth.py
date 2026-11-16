@@ -47,6 +47,9 @@ class AuthorizationServer:
     accept: Literal["access_token", "id_token"] = "access_token"
     expires_in: int = 3600
     rotate_refresh_tokens: bool = False
+    # Non-standard lifetimes of the refresh token added to every token response, such as
+    # {"refresh_token_expires_in": 604800} as Google sends, or {"refresh_expires_in": 1800} as Keycloak does
+    refresh_lifetime: dict[str, int] = field(default_factory=dict)
     issue_id_token: bool = True
     # error= in the redirect instead of a code
     deny: str | None = None
@@ -212,6 +215,7 @@ class App:
             "token_type": "Bearer",
             "expires_in": auth.expires_in,
             "scope": "openid email",
+            **auth.refresh_lifetime,
         }
         if auth.issue_id_token:
             token = id_token(time.time() + auth.expires_in)

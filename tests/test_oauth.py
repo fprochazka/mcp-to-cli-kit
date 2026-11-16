@@ -13,6 +13,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -350,21 +351,204 @@ class TestBearer:
         assert_no_secrets(result, protected_server)
 
 
+DEFAULT_STATUS_FIELDS = ["server", "signed_in", "identity", "signed_in_at", "signed_in_until"]
+
+FULL_STATUS_FIELDS = [
+    *DEFAULT_STATUS_FIELDS,
+    "bearer",
+    "access_token_expires_at",
+    "id_token_expires_at",
+    "has_refresh_token",
+    "refresh_token_expires_at",
+    "obtained_at",
+    "scopes",
+    "client_id",
+    "issuer",
+    "resource",
+    "token_file",
+]
+
+
+def status(run: Run, *args: str) -> tuple[int, dict[str, Any]]:
+    result = run(["auth", "status", "--json", *args])
+    [entry] = json.loads(result.stdout)["servers"]
+    return result.exit_code, entry
+
+
+def epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso).timestamp()
+
+
+def edit_stored(change: Callable[[dict[str, Any]], object]) -> None:
+    content = stored()
+    change(content)
+    token_file().write_text(json.dumps(content), encoding="utf-8")
+
+
+class TestRefreshExpiry:
+    @pytest.mark.parametrize("name", ["refresh_token_expires_in", "refresh_expires_in"])
+    def test_the_refresh_token_lifetime_is_stored(self, run: Run, protected_server: ProtectedServer, name: str) -> None:
+        protected_server.auth.refresh_lifetime = {name: 604800}
+        before = time.time()
+
+        sign_in(run)
+
+        assert before + 604800 <= stored()["refresh_expires_at"] <= time.time() + 604800
+        exit_code, entry = status(run)
+        assert exit_code == 0
+        assert entry["signed_in_until"] == datetime.fromtimestamp(stored()["refresh_expires_at"], UTC).isoformat(
+            timespec="seconds"
+        )
+
+    def test_a_zero_lifetime_counts_as_unknown(self, run: Run, protected_server: ProtectedServer) -> None:
+        protected_server.auth.refresh_lifetime = {"refresh_expires_in": 0}
+
+        sign_in(run)
+
+        assert stored()["refresh_expires_at"] is None
+        assert status(run)[1]["signed_in_until"] is None
+
+    def test_a_refresh_keeps_the_lifetime_of_the_kept_refresh_token(
+        self, run: Run, protected_server: ProtectedServer
+    ) -> None:
+        protected_server.auth.refresh_lifetime = {"refresh_token_expires_in": 604800}
+        sign_in(run)
+        signed_in = stored()
+        protected_server.auth.refresh_lifetime = {}
+        expire()
+
+        assert run(["search-items", "--query", "x"]).exit_code == 0
+
+        refreshed = stored()
+        assert protected_server.auth.refresh_grants()
+        assert refreshed["refresh_token"] == signed_in["refresh_token"]
+        assert refreshed["refresh_expires_at"] == signed_in["refresh_expires_at"]
+        assert refreshed["signed_in_at"] == signed_in["signed_in_at"]
+        assert refreshed["obtained_at"] > signed_in["obtained_at"]
+
+    def test_a_refresh_that_states_the_lifetime_replaces_it(self, run: Run, protected_server: ProtectedServer) -> None:
+        protected_server.auth.refresh_lifetime = {"refresh_token_expires_in": 604800}
+        sign_in(run)
+        protected_server.auth.refresh_lifetime = {"refresh_token_expires_in": 1000}
+        expire()
+
+        assert run(["search-items", "--query", "x"]).exit_code == 0
+
+        assert stored()["refresh_expires_at"] <= time.time() + 1000
+
+    def test_a_rotated_refresh_token_without_a_lifetime_has_none(
+        self, run: Run, protected_server: ProtectedServer
+    ) -> None:
+        protected_server.auth.refresh_lifetime = {"refresh_token_expires_in": 604800}
+        protected_server.auth.rotate_refresh_tokens = True
+        sign_in(run)
+        signed_in = stored()
+        protected_server.auth.refresh_lifetime = {}
+        expire()
+
+        assert run(["search-items", "--query", "x"]).exit_code == 0
+
+        refreshed = stored()
+        assert refreshed["refresh_token"] != signed_in["refresh_token"]
+        assert refreshed["refresh_expires_at"] is None
+        assert refreshed["signed_in_at"] == signed_in["signed_in_at"]
+
+    def test_an_expired_refresh_token_is_not_signed_in(self, run: Run, protected_server: ProtectedServer) -> None:
+        protected_server.auth.refresh_lifetime = {"refresh_token_expires_in": 604800}
+        sign_in(run)
+        expire()
+        edit_stored(lambda content: content.update(refresh_expires_at=time.time() - 10))
+
+        exit_code, entry = status(run)
+
+        assert exit_code == 4
+        assert entry["signed_in"] is False and entry["signed_in_until"] is not None
+
+
+class TestTokenFile:
+    def test_a_file_from_before_the_refresh_expiry_still_signs_in(
+        self, run: Run, protected_server: ProtectedServer
+    ) -> None:
+        sign_in(run)
+        edit_stored(lambda content: [content.pop(key) for key in ("refresh_expires_at", "signed_in_at")])
+        expire()
+
+        exit_code, entry = status(run)
+        assert exit_code == 0
+        assert entry["signed_in"] is True and entry["signed_in_at"] is None and entry["signed_in_until"] is None
+
+        assert run(["search-items", "--query", "x"]).exit_code == 0, "the old file refreshes"
+        assert stored()["version"] == 1 and stored()["signed_in_at"] is None
+
+    def test_fields_of_a_later_version_are_ignored(self, run: Run, protected_server: ProtectedServer) -> None:
+        sign_in(run)
+        edit_stored(lambda content: content.update(added_later="x"))
+
+        assert status(run)[1]["signed_in"] is True
+        assert run(["search-items", "--query", "x"]).exit_code == 0
+
+
 class TestStatusAndLogout:
     def test_status_before_and_after_signing_in(self, run: Run, protected_server: ProtectedServer) -> None:
         before = run(["auth", "status", "--json"])
         assert before.exit_code == 4
-        assert json.loads(before.stdout)["servers"][0]["signed_in"] is False
+        assert json.loads(before.stdout)["servers"] == [
+            {"server": "example", "signed_in": False, "identity": None, "signed_in_at": None, "signed_in_until": None}
+        ]
 
+        started = time.time()
         sign_in(run)
         after = run(["auth", "status", "--json"])
 
         assert after.exit_code == 0, after.stderr
         [entry] = json.loads(after.stdout)["servers"]
-        assert entry["server"] == "example" and entry["signed_in"] is True and entry["refreshable"] is True
-        assert entry["identity"] == EMAIL and entry["bearer"] == "access_token"
+        assert list(entry) == DEFAULT_STATUS_FIELDS
+        assert entry["server"] == "example" and entry["signed_in"] is True and entry["identity"] == EMAIL
+        assert started - 1 <= epoch(entry["signed_in_at"]) <= time.time()
+        # A refresh token of unknown lifetime: the sign-in lasts until the authorization server ends it.
+        assert entry["signed_in_until"] is None
+        assert_no_secrets(after, protected_server)
+
+    def test_full_status(self, run: Run, protected_server: ProtectedServer) -> None:
+        before = run(["auth", "status", "--full", "--json"])
+        assert before.exit_code == 4
+        [entry] = json.loads(before.stdout)["servers"]
+        assert list(entry) == FULL_STATUS_FIELDS
+        assert entry["has_refresh_token"] is False and entry["client_id"] == CLIENT_ID
+
+        protected_server.auth.refresh_lifetime = {"refresh_token_expires_in": 604800}
+        sign_in(run)
+        after = run(["auth", "status", "--full", "--json"])
+
+        assert after.exit_code == 0, after.stderr
+        [entry] = json.loads(after.stdout)["servers"]
+        assert list(entry) == FULL_STATUS_FIELDS
+        assert entry["bearer"] == "access_token" and entry["has_refresh_token"] is True
+        assert entry["signed_in_until"] == entry["refresh_token_expires_at"]
+        assert 3000 < epoch(entry["access_token_expires_at"]) - time.time() <= 3600
+        assert 3000 < epoch(entry["id_token_expires_at"]) - time.time() <= 3600
+        assert entry["obtained_at"] == entry["signed_in_at"]
+        assert entry["scopes"] == ["openid", "email"]
+        assert entry["client_id"] == CLIENT_ID and entry["issuer"] == protected_server.origin
+        assert entry["resource"] == protected_server.origin
         assert entry["token_file"] == str(token_file())
         assert_no_secrets(after, protected_server)
+
+    def test_without_a_refresh_token_the_sign_in_lasts_as_long_as_the_bearer(
+        self, run: Run, protected_server: ProtectedServer
+    ) -> None:
+        protected_server.auth.accept = "id_token"
+        sign_in(run, bearer="id_token")
+        edit_stored(lambda content: content.update(refresh_token=None, refresh_expires_at=None))
+
+        result = run(["auth", "status", "--full", "--json"], bearer="id_token")
+
+        [entry] = json.loads(result.stdout)["servers"]
+        assert entry["signed_in"] is True and entry["has_refresh_token"] is False
+        assert entry["signed_in_until"] == entry["id_token_expires_at"] is not None
+
+        expire()
+        assert run(["auth", "status"], bearer="id_token").exit_code == 4
 
     def test_logout_deletes_the_tokens(self, run: Run, protected_server: ProtectedServer) -> None:
         sign_in(run)
