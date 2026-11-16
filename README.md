@@ -133,10 +133,44 @@ servers:
 - `--help`, a tool's `--help` and `schema` still work offline from a fresh tool cache when the variable is unset. With an expired cache the CLI warns and uses it, as when the server is down.
 - A template can come from any layer: the code default, the config file, or an environment variable such as `EXAMPLE_TOOL_SERVERS__EXAMPLE__HEADERS__AUTHORIZATION='Bearer ${EXAMPLE_TOKEN}'`.
 - `$${` is a literal `${`. A `$` not followed by `{` stays as it is. A `${` without a closing `}`, or one that does not enclose a variable name (letters, digits and `_`), is a config error when the config is loaded.
-- Only `url` and the header values are expanded. Names (servers, mounts, tool groups, tools) and help texts are taken as written.
+- Only `url`, the header values, `auth.client_id` and `auth.client_secret` are expanded. Names (servers, mounts, tool groups, tools) and help texts are taken as written.
 - A URL with references is checked once it is expanded: it must be a valid http(s) URL, and no value may move text into another part of the URL (a `/`, `?`, `#` or `@` in a password, for example), so percent-encode such characters in the variable. An expanded header value must not hold control or non-ASCII characters. Each of these is a config error that names the variable, never its value.
 - Error messages show the URL as configured, with `${NAME}` unexpanded and without its userinfo and query. The parts that carry secrets (the values of the variables in the headers, and the userinfo, password, query and fragment of the expanded URL, also in their percent-encoded forms, if they are 4 characters or longer) are also replaced in transport errors and in the `-v` / `-vv` log. Host, port and path values are not secrets and are shown.
 - The tool cache remembers a hash of the URL as configured and one of the expanded URL. Pointing a variable at another server fetches that server's tools; with the variable unset, the cache of the configured URL is used.
+
+### Signing in with OAuth
+
+A server that follows the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) gets an `auth` key instead of an `Authorization` header. The kit needs a pre-registered OAuth client: it does not register one dynamically.
+
+```yaml
+servers:
+  example:
+    url: https://mcp.example.com/mcp
+    auth:
+      type: oauth
+      client_id: 1234-abcd.apps.googleusercontent.com
+      client_secret: GOCSPX-...    # optional; ${NAME} references work here and in client_id
+      scopes: [openid, email]      # optional; default: the scopes the server announces
+      bearer: access_token         # or id_token, for a proxy that wants an OpenID Connect ID token
+      authorization_server: null   # optional: the issuer, for a server without protected resource metadata
+      redirect_port: 0             # optional: a fixed loopback port, for a client registered with an exact redirect URI
+      resource: true               # optional: false leaves out the RFC 8707 resource parameter
+```
+
+```console
+$ example-tool auth login     # opens the browser, then stores the tokens
+$ example-tool auth status    # who is signed in, as JSON, without the tokens
+$ example-tool auth logout    # deletes the stored tokens; --revoke also revokes the sign-in
+```
+
+- Only `auth login` signs in. It finds the authorization server from the server's protected resource metadata, opens the browser with PKCE (S256) and a redirect to `http://127.0.0.1:<port>/callback`, and waits up to 5 minutes (`--timeout`). It also prints the sign-in address; with `--no-browser` it only prints it. Without a server name it signs in to every server that uses OAuth.
+- Every other command reads the stored tokens and refreshes them when less than 5 minutes remain. It never opens a browser: when there is no sign-in, or the authorization server ended it, the command exits with 4 and names the `auth login` command to run. An AI agent gets that answer at once and can ask the user to sign in.
+- When the server answers 401 to a token the CLI considers valid, the CLI refreshes the token once and sends the request again. The request never reached the server, so this is safe for a tool call too.
+- The tokens are stored in `$XDG_STATE_HOME/<bin>/oauth/<server>.json` (`~/.local/state/...` by default), readable by the owner only. The file records the server URL and the client it was issued for; after either changes in the config, the CLI counts as signed out and never sends the old token. Parallel commands refresh under a file lock, so one refresh serves them all.
+- The client secret is masked in `config`, and the secret and every token are kept out of error messages and the `-v` / `-vv` log.
+- A Google "Desktop app" client is a public client: Google expects its secret to ship with the app, so a consumer can put it in its code default. With Google, `logout --revoke` revokes the sign-in of every app that uses the same client.
+
+`auth` is a reserved command name, like `schema` and `config`. It shows in the help only when a server uses OAuth.
 
 ### Several servers in one bin
 
@@ -234,11 +268,12 @@ $ example-tool config --pretty
 - `${NAME}` references are shown as written, never expanded.
 - Literal text that may be a secret is masked as `***` plus its last 4 characters, or only `***` when it is shorter than 12 characters. These are masked:
   - every header value, except `Accept`, `Content-Type`, `User-Agent` and `X-Mcp-Client` (matched in any case), which are shown as written. A leading `Bearer`, `Basic`, `Token`, `Digest`, `Bot` or `ApiKey` followed by more text stays readable, as in `Bearer ***abcd`;
-  - a URL's whole userinfo (user and password), its query values and its fragment.
+  - a URL's whole userinfo (user and password), its query values and its fragment;
+  - `auth.client_secret`.
 - Shown as written: the URL's scheme, host, port and path, every other setting (timeouts, mounts, tool groups, hidden tools, prefixes, help texts), and all `${NAME}` references.
 - The output follows the usual modes: compact under an AI agent or with `--json`, indented otherwise or with `--pretty`.
 
-`config` is a reserved command name, like `schema`: a tool whose command would be `config` is renamed to `config-tool`, and no group mount or tool group may be called `config`.
+`config` and `auth` are reserved command names, like `schema`: a tool whose command would be one of them is renamed with a `-tool` suffix, and no group mount or tool group may take them.
 
 ### Output and exit codes
 
@@ -250,17 +285,19 @@ Under an AI coding agent (detected from its environment variables), or with `--j
 | 1 | The tool reported an error; its text is on stderr |
 | 2 | Usage or configuration error |
 | 3 | The server could not be reached or did not speak MCP |
+| 4 | The server needs a sign-in that is missing, expired or refused; run `<bin> auth login` |
 
 Other global options: `--refresh-tools` fetches the tool list again, `-v` / `-vv` log to stderr, `--version`. Every request carries an `X-Mcp-Client: <bin>/<version> (mcp-to-cli-kit <version>)` header.
 
 When the server cannot be reached, an expired tool cache is used with a warning. `initialize` and `tools/list` are retried twice on connect errors, timeouts and HTTP 502/503/504; a tool call is retried only when it never reached the server. Ctrl-C abandons the request in flight and exits with 130.
 
-Config and cache live under `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` when those are set, and under `~/.config` and `~/.cache` otherwise.
+Config, cache and OAuth tokens live under `$XDG_CONFIG_HOME`, `$XDG_CACHE_HOME` and `$XDG_STATE_HOME` when those are set, and under `~/.config`, `~/.cache` and `~/.local/state` otherwise.
 
 ## Troubleshooting
 
 - **A call ends with "timed out after 100s".** The server took longer than `sse_read_timeout`, which defaults to 100 seconds so that a coding agent's shell tool (often limited to 120 seconds) sees this error instead of killing the command. Raise `sse_read_timeout` for that server when its tools are legitimately slow. Timeouts exit with 3, never with 1, because the tool's own outcome is unknown.
 - **A call hangs until that timeout although the server already failed.** When a server or proxy cuts a streamed (SSE) answer in the middle, the MCP SDK swallows the broken stream and offers no hook to notice it, so the request ends only with the read timeout. A plain JSON answer cut the same way fails at once.
+- **A command exits with 4 although `auth login` succeeded.** The server refused the token even after a refresh. If the server sits behind a proxy that wants another kind of token, switch `auth.bearer` between `access_token` and `id_token`; the stored sign-in holds both, so no new sign-in is needed. Otherwise the account may lack access to the server.
 - **Something else.** Run with `-v` to see what the CLI does, or `-vv` to also see the HTTP traffic and the MCP SDK's own log.
 
 ## License

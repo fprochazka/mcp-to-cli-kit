@@ -6,7 +6,8 @@ What is masked, the same parts the log redaction treats as secrets:
   ``SHOWN_HEADERS``; a leading known auth scheme word (``Bearer``, ``Basic``, ``Token``,
   ``Digest``, ``Bot``, ``ApiKey``) followed by more text stays readable;
 - a URL's whole userinfo (user and password), the values of its query and its fragment. The
-  scheme, host, port and path are shown.
+  scheme, host, port and path are shown;
+- the literal text of ``auth.client_secret``. The client id is shown.
 
 A masked value becomes ``***`` followed by its last 4 characters, or only ``***`` when it is
 shorter than ``REVEAL_MIN_LENGTH``, so a short secret is not half shown. ``${NAME}`` references
@@ -46,6 +47,9 @@ def describe(loaded: LoadedConfig) -> dict[str, Any]:
             name: value if name.lower() in SHOWN_HEADERS else _mask_template(value, keep_scheme=True)
             for name, value in server["headers"].items()
         }
+        auth = server.get("auth")
+        if isinstance(auth, dict) and isinstance(auth.get("client_secret"), str):
+            auth["client_secret"] = _mask_template(auth["client_secret"])
     return {
         "config_file": str(loaded.path),
         "config_file_loaded": loaded.file_loaded,

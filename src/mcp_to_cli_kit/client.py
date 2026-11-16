@@ -40,6 +40,7 @@ from mcp.shared.exceptions import McpError
 
 from mcp_to_cli_kit import redaction
 from mcp_to_cli_kit.config import ResolvedServer, ServerConfig, expand_server, expand_url
+from mcp_to_cli_kit.oauth import AuthError, AuthTransportError, TokenManager, TokenStore
 
 logger = logging.getLogger(__name__)
 
@@ -337,9 +338,17 @@ class ServerClient:
         portal: Callable[[], BlockingPortal],
         retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS,
         client_info: types.Implementation | None = None,
+        token_store: TokenStore | None = None,
+        login_command: str = "auth login",
     ) -> None:
         self.name = name
         self.server = server
+        self._token_store = token_store
+        self._login_command = login_command
+        self._tokens: TokenManager | None = None
+        # The bearer the open session sends, and one the server answered with 401.
+        self._bearer: str | None = None
+        self._rejected: str | None = None
         # Sent in initialize as clientInfo; without it the SDK announces itself as "mcp".
         self._client_info = client_info
         self._client_header = client_header
@@ -372,6 +381,7 @@ class ServerClient:
 
         Raises:
             ConfigError: The server's config cannot be expanded; see ``resolve``.
+            AuthError: The server needs a sign-in that is missing, expired or refused.
             TransportError: The server could not be reached, after the retries.
             ServerRejectedError: The server answered with a JSON-RPC error.
         """
@@ -396,6 +406,7 @@ class ServerClient:
 
         Raises:
             ConfigError: The server's config cannot be expanded; see ``resolve``.
+            AuthError: The server needs a sign-in that is missing, expired or refused.
             TransportError: The server could not be reached, after the retries.
             ServerRejectedError: The server answered with a JSON-RPC error.
         """
@@ -431,11 +442,24 @@ class ServerClient:
         policy: Callable[[TransportError], bool],
     ) -> _T:
         attempt = 0
+        refreshed = False
         while True:
             try:
                 return self._run(operation)
             except TransportError as error:
                 self.close()
+                if error.status == 401 and self._bearer is not None:
+                    # The bearer was refused before the request reached the server, so even a
+                    # tools/call is safe to send again, once, with a refreshed token.
+                    if refreshed:
+                        raise AuthError(
+                            f"{self.display_url} refused the token of {self.name} even after a refresh. Check "
+                            f"auth.bearer in the config, or sign in again with '{self._login_command}'."
+                        ) from None
+                    refreshed = True
+                    self._rejected = self._bearer
+                    logger.info("%s on %s got HTTP 401; refreshing the token and retrying", what, self.name)
+                    continue
                 if not policy(error) or attempt >= len(self._retry_delays):
                     if attempt:
                         raise TransportError(
@@ -453,7 +477,7 @@ class ServerClient:
                 self._session.close()
             resolved = self.resolve()
             logger.debug("Opening an MCP session with %s (%s)", self.name, self.display_url)
-            headers = {CLIENT_HEADER: self._client_header, **resolved.headers}
+            headers = {CLIENT_HEADER: self._client_header, **resolved.headers, **self._authorization(resolved)}
             self._session = _Session(self._portal(), resolved.url, self.server, headers, self._client_info)
         session = self._session
         try:
@@ -473,6 +497,29 @@ class ServerClient:
             raise TransportError(redaction.redact(str(error)), error.kind, error.status) from None
         except ServerRejectedError as error:
             raise ServerRejectedError(redaction.redact(str(error)), error.code) from None
+
+    def _authorization(self, resolved: ResolvedServer) -> dict[str, str]:
+        """The Authorization header of a server that signs in with OAuth, with a fresh bearer.
+
+        Raises:
+            AuthError: Not signed in, or the sign-in expired.
+            TransportError: The token endpoint could not be reached.
+        """
+        if resolved.auth is None:
+            return {}
+        if self._tokens is None:
+            if self._token_store is None:
+                raise AuthError(f"{self.name} signs in with OAuth, but this CLI has no token store")
+            self._tokens = TokenManager(
+                self.name, resolved.url, resolved.auth, self._token_store, self._login_command, self.server.timeout
+            )
+        rejected, self._rejected = self._rejected, None
+        try:
+            self._bearer = self._tokens.bearer(rejected)
+        except AuthTransportError as error:
+            kind: FailureKind = "status" if error.status is not None else "connect"
+            raise TransportError(redaction.redact(str(error)), kind, error.status) from None
+        return {"Authorization": f"Bearer {self._bearer}"}
 
     def _describe_mcp_error(
         self, error: McpError, trace: _HttpTrace, session_failure: Exception | None = None

@@ -6,8 +6,10 @@ from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+import fixture_auth
 import pytest
 from click.testing import CliRunner, Result
+from fixture_auth import ProtectedServer
 from fixture_server import RunningServer, start
 
 from mcp_to_cli_kit import agent as agent_module
@@ -36,6 +38,14 @@ def sse_server() -> Iterator[RunningServer]:
     server.stop()
 
 
+@pytest.fixture(scope="session")
+def protected_server() -> Iterator[ProtectedServer]:
+    """A server behind OAuth, with its own authorization server."""
+    server = fixture_auth.start()
+    yield server
+    server.stop()
+
+
 @pytest.fixture(autouse=True)
 def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """An empty home directory, no XDG directory overrides and no AI agent, for every test."""
@@ -46,6 +56,7 @@ def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     # the runner's real config and cache. Tests of the XDG behavior set them explicitly.
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     for variable in ALL_AGENT_VARS:
         monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(agent_module, "DEVIN_MARKER", Path("/nonexistent-devin-marker"))
@@ -67,6 +78,10 @@ def reset_servers(request: pytest.FixtureRequest) -> None:
         if name in request.fixturenames:
             server: RunningServer = request.getfixturevalue(name)
             server.recorder.reset()
+    if "protected_server" in request.fixturenames:
+        protected: ProtectedServer = request.getfixturevalue("protected_server")
+        protected.recorder.reset()
+        protected.auth.reset()
 
 
 Invoke = Callable[..., Result]

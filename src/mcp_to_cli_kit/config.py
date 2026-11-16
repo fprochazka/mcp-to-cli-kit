@@ -25,15 +25,18 @@ Environment variables::
     MY_TOOL_SERVERS__ALPHA__STRIP_PREFIXES='["vendor_"]'
                                              lists, objects and mounts are given as JSON
     MY_TOOL_SERVERS__BETA__MOUNT__GROUP=b    one key of a mount, which replaces the whole mount
+    MY_TOOL_SERVERS__ALPHA__AUTH__CLIENT_SECRET=...
+                                             one key of the OAuth settings, merged with the rest
 
 The whole variable name, the prefix included, is matched case-insensitively, and a server
 name matches with ``-`` and ``_`` treated as the same character. Server names therefore
 cannot contain two separators in a row, which would read as the ``__`` nesting.
 
-Values of ``url`` and of ``headers`` may refer to environment variables as ``${NAME}``
-(``$${`` gives a literal ``${``; a ``$`` not followed by ``{`` stays as it is). The references
-are kept as written when the config is loaded and expanded only when a server is contacted,
-so an unset variable fails only the commands that need that server. See ``expand_server``.
+Values of ``url``, ``headers``, ``auth.client_id`` and ``auth.client_secret`` may refer to
+environment variables as ``${NAME}`` (``$${`` gives a literal ``${``; a ``$`` not followed by
+``{`` stays as it is). The references are kept as written when the config is loaded and expanded
+only when a server is contacted, so an unset variable fails only the commands that need that
+server. See ``expand_server``.
 
 Environment variables cannot add a server, only change one the default or the file defines.
 A variable that names no configured server or no known key is ignored and logged at debug
@@ -72,8 +75,9 @@ SERVER_NAME_PATTERN = r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$"
 COMMAND_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 
 # Names the kit reserves for its own commands: "schema" at every level where tools live, "config"
-# at the top level. No group may take them, and a tool that would is renamed with a "-tool" suffix.
-BUILTIN_COMMANDS = frozenset({"schema", "config"})
+# and "auth" at the top level. No group may take them, and a tool that would is renamed with a
+# "-tool" suffix.
+BUILTIN_COMMANDS = frozenset({"schema", "config", "auth"})
 
 
 def _not_builtin(name: str) -> str:
@@ -120,6 +124,44 @@ class ToolGroup(_StrictModel):
     help: str | None = None
 
 
+class OAuthConfig(_StrictModel):
+    """Sign in to the server with OAuth 2.1, as the MCP authorization spec describes, with a pre-registered client.
+
+    ``client_id`` and ``client_secret`` are templates like the header values. The secret of a
+    public client, such as a Google "Desktop app" client, is not confidential and may be part of
+    the consumer's default configuration.
+    """
+
+    type: Literal["oauth"]
+    client_id: Annotated[str, Field(min_length=1)]
+    client_secret: str | None = None
+    # The scopes to ask for. Without them, the scopes the server announces are used.
+    scopes: list[Annotated[str, Field(min_length=1)]] | None = None
+    # access_token is what the MCP spec sends; id_token suits a proxy that wants an OpenID
+    # Connect ID token, such as Google's Identity-Aware Proxy in its classic mode.
+    bearer: Literal["access_token", "id_token"] = "access_token"
+    # The issuer to use instead of the one the server's protected resource metadata names.
+    authorization_server: str | None = None
+    # 0 picks a free port; a client registered with an exact redirect URI needs a fixed one.
+    redirect_port: Annotated[int, Field(ge=0, le=65535)] = 0
+    # The RFC 8707 resource parameter, which the MCP spec requires; off only for a server that rejects it.
+    resource: bool = True
+
+    @field_validator("client_id", "client_secret")
+    @classmethod
+    def _is_template(cls, value: str | None) -> str | None:
+        if value is not None:
+            parse_template(value)
+        return value
+
+    @field_validator("authorization_server")
+    @classmethod
+    def _issuer_is_http(cls, value: str | None) -> str | None:
+        if value is not None:
+            check_http_url(value)
+        return value
+
+
 class ServerConfig(_StrictModel):
     """One MCP server and where its tools appear in the bin.
 
@@ -138,6 +180,7 @@ class ServerConfig(_StrictModel):
     strip_prefixes: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
     tool_groups: list[ToolGroup] = Field(default_factory=list)
     hidden_tools: list[str] = Field(default_factory=list)
+    auth: OAuthConfig | None = None
 
     @field_validator("url")
     @classmethod
@@ -157,6 +200,12 @@ class ServerConfig(_StrictModel):
             except ValueError as error:
                 raise ValueError(f"header {name}: {error}") from None
         return headers
+
+    @model_validator(mode="after")
+    def _one_source_of_authorization(self) -> ServerConfig:
+        if self.auth is not None and any(name.lower() == "authorization" for name in self.headers):
+            raise ValueError("auth and an Authorization header exclude each other; remove one of them")
+        return self
 
     @model_validator(mode="after")
     def _tool_groups_are_distinct(self) -> ServerConfig:
@@ -201,11 +250,21 @@ class VariableReference:
 
 
 @dataclass(frozen=True)
+class ResolvedOAuth:
+    """A server's ``auth`` with its ``client_id`` and ``client_secret`` expanded. Holds secrets; never print it."""
+
+    config: OAuthConfig
+    client_id: str
+    client_secret: str | None
+
+
+@dataclass(frozen=True)
 class ResolvedServer:
-    """A server's ``url`` and ``headers`` with every ``${NAME}`` expanded. Holds secrets; never print it."""
+    """A server's ``url``, ``headers`` and ``auth`` with every ``${NAME}`` expanded. Holds secrets; never print it."""
 
     url: str
     headers: dict[str, str]
+    auth: ResolvedOAuth | None = None
 
 
 _VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -308,8 +367,17 @@ def expand_server(name: str, server: ServerConfig, environ: Mapping[str, str] | 
             raise ConfigError(f"Server {name}: header {header}{source} holds a control or non-ASCII character.")
         headers[header] = expanded
 
+    auth = None
+    if server.auth is not None:
+        client_id = _expand(name, "auth.client_id", server.auth.client_id, environ)
+        secret = server.auth.client_secret
+        client_secret = _expand(name, "auth.client_secret", secret, environ) if secret is not None else None
+        if client_secret is not None:
+            redaction.register_encoded(client_secret, "***")
+        auth = ResolvedOAuth(server.auth, client_id, client_secret)
+
     _register_secrets(server, url, environ)
-    return ResolvedServer(url=url, headers=headers)
+    return ResolvedServer(url=url, headers=headers, auth=auth)
 
 
 def _register_secrets(server: ServerConfig, url: str, environ: Mapping[str, str]) -> None:
@@ -597,7 +665,11 @@ def _env_key(name: str) -> str:
 
 _SERVER_FIELDS = {_env_key(name): name for name in ServerConfig.model_fields}
 
-_JSON_FIELDS = {"headers", "mount", "strip_prefixes", "tool_groups", "hidden_tools"}
+_JSON_FIELDS = {"headers", "mount", "strip_prefixes", "tool_groups", "hidden_tools", "auth"}
+
+_AUTH_FIELDS = {_env_key(name): name for name in OAuthConfig.model_fields}
+
+_AUTH_JSON_FIELDS = {"scopes"}
 
 
 def _read_env(
@@ -659,6 +731,16 @@ def _set_server_field(
     if field == "headers" and len(field_path) == 2:
         headers_below = server_below.get("headers") if isinstance(server_below, Mapping) else None
         server_layer.setdefault("headers", {})[_header_name(field_path[1], headers_below)] = value
+        return
+
+    if field == "auth" and len(field_path) == 2:
+        key = _AUTH_FIELDS.get(field_path[1])
+        if key is None:
+            known = ", ".join(sorted(_AUTH_FIELDS))
+            raise ConfigError(f"Unknown auth key {field_path[1]} in {variable}. Known keys: {known}.")
+        auth_layer = server_layer.setdefault("auth", {})
+        if isinstance(auth_layer, dict):
+            auth_layer[key] = _parse_json(variable, value) if key in _AUTH_JSON_FIELDS else value
         return
 
     if field == "mount" and len(field_path) == 2:

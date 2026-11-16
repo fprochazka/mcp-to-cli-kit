@@ -7,7 +7,8 @@ are eager and ``--help`` is not, so ``--help --config other.yaml`` lists the too
 other config.
 
 Exit codes: 0 on success, 1 when the tool reports an error, 2 for a usage or config error,
-3 when the server cannot be reached or does not speak MCP.
+3 when the server cannot be reached or does not speak MCP, 4 when a server needs a sign-in
+that is missing, expired or refused.
 """
 
 from __future__ import annotations
@@ -20,13 +21,14 @@ import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
 import click
 from mcp import types
 
-from mcp_to_cli_kit import config_view, redaction
+from mcp_to_cli_kit import config_view, oauth, redaction
 from mcp_to_cli_kit.arguments import CompiledTool, compile_tool, kebab_case
 from mcp_to_cli_kit.cache import CachedTools, SchemaCache, default_cache_dir
 from mcp_to_cli_kit.client import (
@@ -46,10 +48,12 @@ from mcp_to_cli_kit.config import (
     GroupMount,
     LoadedConfig,
     PrefixMount,
+    ResolvedServer,
     ToolGroup,
     default_config_path,
     load_config,
 )
+from mcp_to_cli_kit.oauth import AuthError, AuthTransportError, TokenStore, default_token_dir
 from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
 from mcp_to_cli_kit.redaction import RedactingFilter
 
@@ -65,6 +69,7 @@ For servers that report failures as ordinary text.
 EXIT_TOOL_ERROR = 1
 EXIT_USAGE = 2
 EXIT_TRANSPORT = 3
+EXIT_AUTH = 4
 EXIT_INTERRUPTED = 130
 
 _RUNTIME_KEY = "mcp_to_cli_kit.runtime"
@@ -107,6 +112,12 @@ class TransportFailure(click.ClickException):
     """The server could not be reached or did not speak MCP. Printed as one ``Error:`` line."""
 
     exit_code = EXIT_TRANSPORT
+
+
+class AuthFailure(click.ClickException):
+    """A server needs a sign-in that is missing, expired or refused. Printed as one ``Error:`` line."""
+
+    exit_code = EXIT_AUTH
 
 
 @dataclass(frozen=True)
@@ -317,6 +328,7 @@ class TopLevelListing:
     groups: dict[str, str] = field(default_factory=dict)
     unavailable: dict[str, str] = field(default_factory=dict)
     unresolved: set[str] = field(default_factory=set)
+    unauthenticated: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -336,13 +348,30 @@ class Runtime:
 
     def __post_init__(self) -> None:
         self.cache = SchemaCache(default_cache_dir(self.app.bin_name))
+        self.tokens = TokenStore(default_token_dir(self.app.bin_name))
         version = self.app.bin_version
         header = client_header_value(self.app.bin_name, version)
         client_info = types.Implementation(name=self.app.bin_name, version=version)
         for name, server in self.loaded.config.servers.items():
             self.clients[name] = ServerClient(
-                name, server, header, self.portal, self.app.retry_delays, client_info=client_info
+                name,
+                server,
+                header,
+                self.portal,
+                self.app.retry_delays,
+                client_info=client_info,
+                token_store=self.tokens,
+                login_command=self.login_command(name),
             )
+
+    def oauth_servers(self) -> list[str]:
+        """The servers that sign in with OAuth, in config order."""
+        return [name for name, server in self.config.servers.items() if server.auth is not None]
+
+    def login_command(self, server: str) -> str:
+        """The command that signs in to a server; it names the server only when the bin has several to sign in to."""
+        several = len([name for name, config in self.loaded.config.servers.items() if config.auth is not None]) > 1
+        return f"{self.app.bin_name} auth login" + (f" {server}" if several else "")
 
     def close(self) -> None:
         for client in self.clients.values():
@@ -367,10 +396,12 @@ class Runtime:
         self._live.add(server)
         try:
             tools = client.list_tools()
-        except (TransportError, ServerRejectedError, ConfigError) as error:
+        except (TransportError, ServerRejectedError, ConfigError, AuthError) as error:
             if fallback is None:
                 if isinstance(error, ConfigError):
                     raise UnresolvedServer(str(error)) from error
+                if isinstance(error, AuthError):
+                    raise AuthFailure(f"cannot list the tools of {server}: {error}") from error
                 raise TransportFailure(f"cannot list the tools of {client.display_url} ({server}): {error}") from error
             click.echo(
                 f"{self.app.bin_name}: warning: cannot refresh the tool list of {server} ({error}); "
@@ -509,13 +540,13 @@ class Runtime:
                 found[server] = replace(entry, command=prefix + entry.command)
 
         to_ask = unknown if found else candidates
-        unchecked: list[tuple[str, TransportFailure | UnresolvedServer]] = []
+        unchecked: list[tuple[str, TransportFailure | UnresolvedServer | AuthFailure]] = []
         for server, prefix in to_ask:
             if server in found:
                 continue
             try:
                 entry = self.find_in_server(server, name[len(prefix) :])
-            except (TransportFailure, UnresolvedServer) as error:
+            except (TransportFailure, UnresolvedServer, AuthFailure) as error:
                 unchecked.append((server, error))
                 continue
             if entry is not None:
@@ -535,6 +566,8 @@ class Runtime:
             message = "\n".join(failure.format_message() for _, failure in unchecked)
             if any(isinstance(failure, UnresolvedServer) for _, failure in unchecked):
                 raise ConfigFailure(message)
+            if any(isinstance(failure, AuthFailure) for _, failure in unchecked):
+                raise AuthFailure(message)
             raise TransportFailure(message)
         return None
 
@@ -570,10 +603,12 @@ class Runtime:
         for server, prefix in self.top_level_servers():
             try:
                 tools = self.server_tools(server)
-            except (TransportFailure, UnresolvedServer) as error:
+            except (TransportFailure, UnresolvedServer, AuthFailure) as error:
                 listing.unavailable[server] = error.format_message()
                 if isinstance(error, UnresolvedServer):
                     listing.unresolved.add(server)
+                if isinstance(error, AuthFailure):
+                    listing.unauthenticated.add(server)
                 continue
             for command, entry in tools.entries.items():
                 full = prefix + command
@@ -835,7 +870,7 @@ class KitGroup(click.Group):
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         listing = self._listing(ctx)
-        return sorted([*listing.tools, *listing.groups, *BUILTIN_COMMANDS])  # schema and config
+        return sorted([*listing.tools, *listing.groups, *_top_level_builtins(_runtime(ctx))])
 
     def _listing(self, ctx: click.Context) -> TopLevelListing:
         runtime = _runtime(ctx)
@@ -843,7 +878,9 @@ class KitGroup(click.Group):
         if listing.unavailable and not listing.tools and not listing.groups:
             # Nothing at all to show: the failures are the answer, as an error.
             message = "\n".join(listing.unavailable.values())
-            raise ConfigFailure(message) if listing.unresolved else TransportFailure(message)
+            if listing.unresolved:
+                raise ConfigFailure(message)
+            raise AuthFailure(message) if listing.unauthenticated else TransportFailure(message)
         return listing
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
@@ -851,6 +888,8 @@ class KitGroup(click.Group):
             return SchemaCommand()
         if cmd_name == ConfigCommand.NAME:
             return ConfigCommand()
+        if cmd_name == AuthGroup.NAME:
+            return AuthGroup()
         runtime = _runtime(ctx)
         groups = runtime.group_mounts()
         if cmd_name in groups:
@@ -879,7 +918,7 @@ class KitGroup(click.Group):
         if rows:
             with formatter.section("Tools"):
                 formatter.write_dl(rows)
-        _write_builtins(formatter, top_level=True)
+        _write_builtins(formatter, top_level=True, auth=bool(_runtime(ctx).oauth_servers()))
         if listing.unavailable:
             with formatter.section("Unavailable servers"):
                 formatter.write_dl(sorted(listing.unavailable.items()))
@@ -996,10 +1035,17 @@ class SchemaCommand(click.Command):
         _write(json.dumps(schema, ensure_ascii=False, indent=indent) + "\n", "stdout")
 
 
-def _write_builtins(formatter: click.HelpFormatter, *, top_level: bool = False) -> None:
+def _top_level_builtins(runtime: Runtime) -> list[str]:
+    """The built-in commands at the top level; ``auth`` only when a server signs in with OAuth."""
+    return [name for name in BUILTIN_COMMANDS if name != AuthGroup.NAME or runtime.oauth_servers()]
+
+
+def _write_builtins(formatter: click.HelpFormatter, *, top_level: bool = False, auth: bool = False) -> None:
     rows = [(SchemaCommand.NAME, SchemaCommand.HELP)]
     if top_level:
         rows.append((ConfigCommand.NAME, ConfigCommand.HELP))
+    if auth:
+        rows.append((AuthGroup.NAME, AuthGroup.HELP))
     with formatter.section("Commands"):
         formatter.write_dl(sorted(rows))
 
@@ -1059,6 +1105,178 @@ class ConfigCommand(click.Command):
         _write(json.dumps(config_view.describe(loaded), ensure_ascii=False, indent=indent) + "\n", "stdout")
 
 
+class AuthGroup(click.Group):
+    """``auth``: sign in to the servers that use OAuth, sign out, and show who is signed in.
+
+    Signing in is only ever done here. A tool command never opens a browser: without a usable
+    sign-in it exits with ``EXIT_AUTH``, so an AI agent gets an answer at once instead of a
+    command that waits for a person.
+    """
+
+    NAME = "auth"
+    HELP = "Sign in to the servers that use OAuth, sign out, or show the sign-in state."
+
+    def __init__(self) -> None:
+        super().__init__(name=self.NAME, help=self.HELP, no_args_is_help=True)
+        server = click.Argument(["server"], required=False, metavar="[SERVER]")
+        self.add_command(
+            click.Command(
+                "login",
+                callback=_login,
+                help=(
+                    "Sign in to a server through the browser and store its tokens. Without SERVER, sign in to every "
+                    "server that uses OAuth. The sign-in address is also printed, to open by hand. Commands refresh "
+                    "the tokens by themselves afterwards, until the authorization server ends the sign-in."
+                ),
+                params=[
+                    server,
+                    click.Option(
+                        ["--no-browser"],
+                        is_flag=True,
+                        help="Only print the sign-in address; do not open a browser.",
+                    ),
+                    click.Option(
+                        ["--timeout"],
+                        type=click.FloatRange(min=1),
+                        default=oauth.DEFAULT_LOGIN_TIMEOUT_SECONDS,
+                        show_default=True,
+                        help="Seconds to wait for the sign-in in the browser.",
+                    ),
+                ],
+            )
+        )
+        self.add_command(
+            click.Command(
+                "logout",
+                callback=_logout,
+                help=(
+                    "Delete the stored tokens of a server, or of every server that uses OAuth. With --revoke, also "
+                    "revoke the sign-in at the authorization server. Google revokes it for every app that uses the "
+                    "same OAuth client, so other tools signed in with that client are signed out too."
+                ),
+                params=[
+                    click.Argument(["server"], required=False, metavar="[SERVER]"),
+                    click.Option(
+                        ["--revoke"], is_flag=True, help="Also revoke the sign-in at the authorization server."
+                    ),
+                ],
+            )
+        )
+        self.add_command(
+            click.Command(
+                "status",
+                callback=_status,
+                help=(
+                    "Print the sign-in state of each server that uses OAuth as JSON, without the tokens. Nothing is "
+                    "sent to any server. Exits 4 when a server is not signed in."
+                ),
+                params=[click.Argument(["server"], required=False, metavar="[SERVER]"), *_mode_options()],
+            )
+        )
+
+
+def _oauth_targets(server: str | None) -> tuple[Runtime, list[str]]:
+    ctx = click.get_current_context()
+    runtime = _runtime(ctx)
+    names = runtime.oauth_servers()
+    if server is None:
+        if not names:
+            raise click.UsageError("No configured server signs in with OAuth.", ctx)
+        return runtime, names
+    if server not in runtime.config.servers:
+        raise click.UsageError(f"No server named {server!r}. Servers: {', '.join(runtime.config.servers)}.", ctx)
+    if server not in names:
+        raise click.UsageError(f"The server {server!r} does not sign in with OAuth (it has no auth key).", ctx)
+    return runtime, [server]
+
+
+def _resolved(runtime: Runtime, name: str) -> ResolvedServer:
+    try:
+        resolved = runtime.clients[name].resolve()
+    except ConfigError as error:
+        raise ConfigFailure(str(error)) from error
+    assert resolved.auth is not None
+    return resolved
+
+
+def _login(server: str | None, no_browser: bool, timeout: float) -> None:
+    runtime, names = _oauth_targets(server)
+    for name in names:
+        resolved = _resolved(runtime, name)
+        assert resolved.auth is not None
+        try:
+            tokens = oauth.login(
+                name,
+                resolved.url,
+                resolved.auth,
+                runtime.tokens,
+                echo=lambda line: click.echo(line, err=True),
+                browser=not no_browser,
+                wait_timeout=timeout,
+                http_timeout=runtime.config.servers[name].timeout,
+            )
+        except AuthError as error:
+            raise AuthFailure(f"signing in to {name} failed: {error}") from error
+        except AuthTransportError as error:
+            raise TransportFailure(f"signing in to {name} failed: {error}") from error
+        who = f" as {tokens.identity}" if tokens.identity else ""
+        click.echo(f"Signed in to {name}{who}.", err=True)
+
+
+def _logout(server: str | None, revoke: bool) -> None:
+    runtime, names = _oauth_targets(server)
+    for name in names:
+        tokens = runtime.tokens.load(name)
+        if tokens is None:
+            click.echo(f"Not signed in to {name}.", err=True)
+            continue
+        if revoke:
+            resolved = _resolved(runtime, name)
+            assert resolved.auth is not None
+            try:
+                if not oauth.revoke(tokens, resolved.auth, runtime.config.servers[name].timeout):
+                    click.echo(f"The authorization server of {name} offers no revocation; only signing out.", err=True)
+            except AuthError as error:
+                raise AuthFailure(f"revoking the sign-in to {name} failed: {error}") from error
+            except AuthTransportError as error:
+                raise TransportFailure(f"revoking the sign-in to {name} failed: {error}") from error
+        runtime.tokens.delete(name)
+        click.echo(f"Signed out of {name}.", err=True)
+
+
+def _status(server: str | None, machine_output: bool, pretty_output: bool) -> None:
+    ctx = click.get_current_context()
+    runtime, names = _oauth_targets(server)
+    servers = []
+    for name in names:
+        resolved = _resolved(runtime, name)
+        assert resolved.auth is not None
+        kind = resolved.auth.config.bearer
+        stored = runtime.tokens.load(name)
+        tokens = stored if stored is not None and stored.is_for(resolved.url, resolved.auth) else None
+        expiry = tokens.expiry(kind) if tokens is not None else None
+        servers.append(
+            {
+                "server": name,
+                "signed_in": tokens is not None and (tokens.is_fresh(kind) or tokens.refresh_token is not None),
+                "identity": tokens.identity if tokens is not None else None,
+                "bearer": kind,
+                "expires_at": _iso_time(expiry) if expiry is not None else None,
+                "refreshable": tokens is not None and tokens.refresh_token is not None,
+                "scopes": tokens.scope.split() if tokens is not None and tokens.scope else [],
+                "token_file": str(runtime.tokens.path(name)),
+            }
+        )
+    mode = resolve_mode(*_modes(ctx))
+    _write(json.dumps({"servers": servers}, indent=2 if mode == "pretty" else None) + "\n", "stdout")
+    if not all(entry["signed_in"] for entry in servers):
+        ctx.exit(EXIT_AUTH)
+
+
+def _iso_time(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=UTC).isoformat(timespec="seconds")
+
+
 class ToolCommand(click.Command):
     """One tool as a command; its options are compiled from the tool's input schema."""
 
@@ -1104,6 +1322,8 @@ class ToolCommand(click.Command):
             result = client.call_tool(self.entry.name, arguments)
         except ConfigError as error:
             raise ConfigFailure(str(error)) from error
+        except AuthError as error:
+            raise AuthFailure(str(error)) from error
         except TransportError as error:
             raise TransportFailure(str(error)) from error
         except ServerRejectedError as error:
