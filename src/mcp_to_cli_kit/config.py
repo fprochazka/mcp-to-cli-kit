@@ -47,7 +47,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +58,7 @@ import yaml
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from mcp_to_cli_kit import redaction
+from mcp_to_cli_kit.files import write_private
 
 logger = logging.getLogger(__name__)
 
@@ -518,19 +518,7 @@ def save_config(path: str | os.PathLike[str], data: Mapping[str, Any] | CliConfi
         The path written, with symlinks resolved.
     """
     target = Path(path).expanduser().resolve()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    content = yaml.safe_dump(_as_dict(data), sort_keys=False, allow_unicode=True)
-
-    descriptor, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, target)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
-    os.chmod(target, 0o600)
+    write_private(target, yaml.safe_dump(_as_dict(data), sort_keys=False, allow_unicode=True))
     return target
 
 

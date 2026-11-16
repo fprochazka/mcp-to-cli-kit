@@ -18,14 +18,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from mcp_to_cli_kit.config import xdg_directory
+from mcp_to_cli_kit.files import write_private
 
 logger = logging.getLogger(__name__)
 
@@ -106,15 +105,7 @@ class SchemaCache:
         content.update(fetched_at=time.time(), tools=tools)
         path = self.path(server)
         try:
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            descriptor, temporary = tempfile.mkstemp(dir=self.directory, prefix=f".{server}.", suffix=".tmp")
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                    json.dump(content, handle, ensure_ascii=False)
-                os.replace(temporary, path)
-            except BaseException:
-                Path(temporary).unlink(missing_ok=True)
-                raise
+            write_private(path, json.dumps(content, ensure_ascii=False))
         except OSError as error:
             logger.warning("Cannot write the tool cache %s: %s", path, error)
 
