@@ -22,7 +22,7 @@ A consumer is a small Python package with one console script. It names the bin, 
 [project]
 name = "example-tool"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = ["mcp-to-cli-kit"]
 
 [project.scripts]
@@ -313,7 +313,7 @@ uv run mypy --strict src
 uv run pytest
 ```
 
-CI runs the tests on Python 3.11 to 3.14.
+CI runs the tests on Python 3.12 to 3.15.
 
 ### Commit hooks
 
