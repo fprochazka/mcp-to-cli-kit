@@ -301,6 +301,20 @@ Config, cache and OAuth tokens live under `$XDG_CONFIG_HOME`, `$XDG_CACHE_HOME` 
 - **A command exits with 4 although `auth login` succeeded.** The server refused the token even after a refresh. If the server sits behind a proxy that wants another kind of token, switch `auth.bearer` between `access_token` and `id_token`; the stored sign-in holds both, so no new sign-in is needed. Otherwise the account may lack access to the server.
 - **Something else.** Run with `-v` to see what the CLI does, or `-vv` to also see the HTTP traffic and the MCP SDK's own log.
 
+## Developing
+
+Install the dependencies, then run the same checks as CI:
+
+```bash
+uv sync --dev
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy --strict src
+uv run pytest
+```
+
+CI runs the tests on Python 3.11 to 3.14.
+
 ## License
 
 MIT
