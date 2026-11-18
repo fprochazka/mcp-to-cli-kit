@@ -514,6 +514,7 @@ def load_config(
     config_path: str | os.PathLike[str] | None = None,
     environ: Mapping[str, str] | None = None,
     env_prefix: str | None = None,
+    command: str | None = None,
 ) -> LoadedConfig:
     """Merge the code default, the config file and the environment, and validate the result.
 
@@ -523,6 +524,8 @@ def load_config(
         config_path: The ``--config`` value; when given, the file must exist.
         environ: The environment to read, ``os.environ`` when None.
         env_prefix: Overrides the prefix derived from the bin name.
+        command: How the user calls the CLI, such as ``host mcp`` when it is mounted under a host
+            CLI, for the error messages; the bin name when None.
 
     Returns:
         The validated configuration.
@@ -545,7 +548,7 @@ def load_config(
         raise ConfigError(f"Config file {path} does not exist.")
     elif default is None:
         raise ConfigError(
-            f"{bin_name} has no configuration. Create {path} with at least one server, for example:\n\n"
+            f"{command or bin_name} has no configuration. Create {path} with at least one server, for example:\n\n"
             + yaml.safe_dump({"servers": {"example": {"url": "https://mcp.example.com/mcp"}}}, sort_keys=False)
         )
 

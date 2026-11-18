@@ -23,7 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 from mcp import types
@@ -56,6 +56,9 @@ from mcp_to_cli_kit.config import (
 from mcp_to_cli_kit.logs import configure_logging
 from mcp_to_cli_kit.oauth import AuthError, AuthTransportError, TokenStore, default_token_dir
 from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
+
+if TYPE_CHECKING:
+    from click.shell_completion import CompletionItem
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +335,8 @@ class Runtime:
     app: App
     loaded: LoadedConfig
     refresh: bool
+    command_path: str = ""
+    """How the user calls the kit group, such as ``host mcp`` when it is mounted under a host CLI; for hints."""
     portal: PortalProvider = field(default_factory=PortalProvider)
     clients: dict[str, ServerClient] = field(default_factory=dict)
     cache: SchemaCache = field(init=False)
@@ -341,6 +346,7 @@ class Runtime:
     _listing: TopLevelListing | None = None
 
     def __post_init__(self) -> None:
+        self.command_path = self.command_path or self.app.bin_name
         self.cache = SchemaCache(default_cache_dir(self.app.bin_name))
         self.tokens = TokenStore(default_token_dir(self.app.bin_name))
         version = self.app.bin_version
@@ -365,7 +371,7 @@ class Runtime:
     def login_command(self, server: str) -> str:
         """The command that signs in to a server; it names the server only when the bin has several to sign in to."""
         several = len([name for name, config in self.loaded.config.servers.items() if config.auth is not None]) > 1
-        return f"{self.app.bin_name} auth login" + (f" {server}" if several else "")
+        return f"{self.command_path} auth login" + (f" {server}" if several else "")
 
     def close(self) -> None:
         for client in self.clients.values():
@@ -398,7 +404,7 @@ class Runtime:
                     raise AuthFailure(f"cannot list the tools of {server}: {error}") from error
                 raise TransportFailure(f"cannot list the tools of {client.display_url} ({server}): {error}") from error
             click.echo(
-                f"{self.app.bin_name}: warning: cannot refresh the tool list of {server} ({error}); "
+                f"{self.command_path}: warning: cannot refresh the tool list of {server} ({error}); "
                 "using the expired cached list.",
                 err=True,
             )
@@ -551,7 +557,7 @@ class Runtime:
         if found:
             for server, failure in unchecked:
                 click.echo(
-                    f"{self.app.bin_name}: warning: could not check server {server} for a conflicting tool "
+                    f"{self.command_path}: warning: could not check server {server} for a conflicting tool "
                     f"({failure.format_message()})",
                     err=True,
                 )
@@ -704,22 +710,59 @@ def _modes(ctx: click.Context) -> list[OutputMode | None]:
     return modes
 
 
-def _runtime(ctx: click.Context) -> Runtime:
-    root = ctx.find_root()
-    runtime = root.meta.get(_RUNTIME_KEY)
-    if isinstance(runtime, Runtime):
-        return runtime
-    group = root.command
-    assert isinstance(group, KitGroup)
+def _kit_context(ctx: click.Context) -> tuple[click.Context, KitGroup]:
+    """The context of the nearest ``KitGroup`` around a command: the root, or a host CLI's subcommand."""
+    current: click.Context | None = ctx
+    while current is not None:
+        if isinstance(current.command, KitGroup):
+            return current, current.command
+        current = current.parent
+    raise RuntimeError(f"{ctx.command_path} does not run inside a kit group")
+
+
+def _runtime_owner(kit_ctx: click.Context) -> click.Context:
+    """The context whose closing closes the runtime.
+
+    Shell completion closes each context it resolves a subcommand with before it resolves the next
+    one or completes an option, and keeps only the root context open throughout. A runtime made
+    while it completes then closes with the root; otherwise with the kit group's own context.
+    """
+    return kit_ctx.find_root() if kit_ctx.resilient_parsing else kit_ctx
+
+
+def _load(kit_ctx: click.Context, group: KitGroup) -> LoadedConfig:
     try:
-        loaded = load_config(
-            group.app.bin_name, default=group.app.default_config, config_path=root.params.get("config")
+        return load_config(
+            group.app.bin_name,
+            default=group.app.default_config,
+            config_path=kit_ctx.params.get("config"),
+            command=kit_ctx.command_path,
         )
     except ConfigError as error:
         raise ConfigFailure(str(error)) from error
-    runtime = Runtime(group.app, loaded, refresh=bool(root.params.get("refresh_tools")))
-    root.meta[_RUNTIME_KEY] = runtime
-    root.call_on_close(runtime.close)
+
+
+def _runtime(ctx: click.Context) -> Runtime:
+    kit_ctx, group = _kit_context(ctx)
+    # Click shares one meta dict across the whole context tree, a host CLI's contexts included.
+    existing = kit_ctx.meta.get(_RUNTIME_KEY)
+    if isinstance(existing, Runtime):
+        return existing
+    runtime = Runtime(
+        group.app,
+        _load(kit_ctx, group),
+        refresh=bool(kit_ctx.params.get("refresh_tools")),
+        command_path=kit_ctx.command_path,
+    )
+    kit_ctx.meta[_RUNTIME_KEY] = runtime
+
+    def close() -> None:
+        # A closed runtime must not serve a later lookup; see _CompletingGroup.
+        if kit_ctx.meta.get(_RUNTIME_KEY) is runtime:
+            del kit_ctx.meta[_RUNTIME_KEY]
+        runtime.close()
+
+    _runtime_owner(kit_ctx).call_on_close(close)
     return runtime
 
 
@@ -734,7 +777,22 @@ def _tool_group_help(server: str, group: ToolGroup) -> str:
     return group.help or f"The {server} tools whose names start with {group.prefix}."
 
 
-class KitGroup(click.Group):
+class _CompletingGroup(click.Group):
+    """A group that may list tools while the shell completes its subcommands.
+
+    Click completes a group's subcommands after it has closed every context, the root included,
+    so a runtime made for the listing would never be closed, and its event loop thread would keep
+    the process alive.
+    """
+
+    def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        try:
+            return super().shell_complete(ctx, incomplete)
+        finally:
+            _runtime_owner(_kit_context(ctx)[0]).close()
+
+
+class KitGroup(_CompletingGroup):
     """The bin's top-level command, whose subcommands are the tools."""
 
     def __init__(self, app: App) -> None:
@@ -827,7 +885,7 @@ class KitGroup(click.Group):
         servers = "an MCP server" if len(config.servers) == 1 else "several MCP servers"
         self.help = config.help or (
             f"Call the tools of {servers}. Each tool is a subcommand; "
-            f"run '{self.app.bin_name} TOOL --help' for its options."
+            f"run '{ctx.command_path} TOOL --help' for its options."
         )
         super().format_help_text(ctx, formatter)
 
@@ -870,7 +928,7 @@ class KitGroup(click.Group):
     def resolve_command(
         self, ctx: click.Context, args: list[str]
     ) -> tuple[str | None, click.Command | None, list[str]]:
-        return _resolve_with_hint(self, ctx, args, self.app.bin_name)
+        return _resolve_with_hint(self, ctx, args, ctx.command_path)
 
     def format_commands(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         listing = self._listing(ctx)
@@ -887,7 +945,7 @@ class KitGroup(click.Group):
                 formatter.write_dl(sorted(listing.unavailable.items()))
 
 
-class MountGroup(click.Group):
+class MountGroup(_CompletingGroup):
     """The subcommand under which a group-mounted server's tools live. Only that server is contacted."""
 
     def __init__(self, server: str, name: str, mount: Any) -> None:
@@ -928,7 +986,7 @@ class MountGroup(click.Group):
         _write_builtins(formatter)
 
 
-class ToolGroupCommand(click.Group):
+class ToolGroupCommand(_CompletingGroup):
     """The tools of one server whose names start with a ``tool_groups`` prefix."""
 
     def __init__(self, server: str, tool_group: ToolGroup, name: str) -> None:
@@ -1054,15 +1112,7 @@ class ConfigCommand(click.Command):
         )
 
     def invoke(self, ctx: click.Context) -> None:
-        root = ctx.find_root()
-        group = root.command
-        assert isinstance(group, KitGroup)
-        try:
-            loaded = load_config(
-                group.app.bin_name, default=group.app.default_config, config_path=root.params.get("config")
-            )
-        except ConfigError as error:
-            raise ConfigFailure(str(error)) from error
+        loaded = _load(*_kit_context(ctx))
         mode = resolve_mode(*_modes(ctx))
         indent = 2 if mode == "pretty" else None
         _write(json.dumps(config_view.describe(loaded), ensure_ascii=False, indent=indent) + "\n", "stdout")

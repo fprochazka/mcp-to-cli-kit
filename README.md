@@ -57,6 +57,8 @@ def main() -> None:
 
 `distribution` is the name of the consumer's own package. The kit reads its version from the package metadata and shows it in `--version`, in the `X-Mcp-Client: example-tool/<version> (mcp-to-cli-kit <version>)` header of every request, and in the `clientInfo` of the MCP `initialize` request. Without it, the kit looks for the package that installed the `example-tool` script, and falls back to `0.1.0`.
 
+Hints such as `Run 'example-tool --help' for the list.` name the command the user typed. A consumer that runs the group from `build_cli()` itself, instead of through `main()`, gets the program name click detects from `sys.argv[0]` there, unless it passes `prog_name`.
+
 ### Results reported as text
 
 Some servers report a failure as an ordinary result instead of setting `isError`. A `result_classifier` turns such a result into an error: it is printed to stderr and the exit code is 1. The kit calls it only for results the server did not already mark as errors.
@@ -74,6 +76,28 @@ def is_error(server: str, tool: str, result: types.CallToolResult) -> bool:
 def main() -> None:
     kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool", result_classifier=is_error)
 ```
+
+### Mounting under a host CLI
+
+The group `build_cli()` returns can also be a subcommand of a larger click CLI, so that `example mcp search-items ...` calls the tools next to the host's own commands:
+
+```python
+import click
+
+from mcp_to_cli_kit.cli import build_cli
+
+
+@click.group()
+def example() -> None:
+    """The example CLI."""
+
+
+example.add_command(build_cli("example-mcp", DEFAULT_CONFIG, distribution="example-tool"), name="mcp")
+```
+
+- The kit's global options belong to the mounted group: `example mcp --config other.yaml search-items`, not `example --config other.yaml mcp search-items`.
+- Hints and usage lines name the path the user typed: `Run 'example mcp --help' for the list.`, `Run 'example mcp auth login' in a terminal`.
+- The bin name passed to `build_cli()` still names the config, cache and token directories, the environment variable prefix (`EXAMPLE_MCP_`), the `X-Mcp-Client` header and the MCP `clientInfo`, so the mounted group shares them with a standalone `example-mcp` script built from the same arguments.
 
 ### Developing the kit and a consumer together
 
