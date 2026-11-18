@@ -418,6 +418,8 @@ Other global options: `--refresh-tools` fetches the tool list again, `-v` / `-vv
 
 When the server cannot be reached, an expired tool cache is used with a warning. `initialize` and `tools/list` are retried twice on connect errors, timeouts and HTTP 502/503/504; a tool call is retried only when it never reached the server. Ctrl-C abandons the request in flight and exits with 130.
 
+Commands that need no server, `--help` and a tool's `--help` from a fresh cache, `schema`, `config` and a consumer's own commands, do not import the MCP SDK, httpx or anyio, so they start several times faster than a command that contacts a server.
+
 Config, cache and OAuth tokens live under `$XDG_CONFIG_HOME`, `$XDG_CACHE_HOME` and `$XDG_STATE_HOME` when those are set, and under `~/.config`, `~/.cache` and `~/.local/state` otherwise.
 
 ## Troubleshooting

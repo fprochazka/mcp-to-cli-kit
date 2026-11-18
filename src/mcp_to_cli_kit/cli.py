@@ -9,6 +9,10 @@ other config.
 Exit codes: 0 on success, 1 when the tool reports an error, 2 for a usage or config error,
 3 when the server cannot be reached or does not speak MCP, 4 when a server needs a sign-in
 that is missing, expired or refused.
+
+The MCP SDK, httpx and anyio are imported only by the code that contacts a server or prints a
+tool's result. ``--help`` from a fresh cache, ``schema``, ``config`` and a consumer's extra
+commands start without them, which saves most of the start-up time.
 """
 
 from __future__ import annotations
@@ -26,12 +30,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
-from mcp import types
 
-from mcp_to_cli_kit import config_view, oauth, redaction
+from mcp_to_cli_kit import config_view, redaction
 from mcp_to_cli_kit.arguments import CompiledTool, compile_tool, kebab_case
 from mcp_to_cli_kit.cache import CachedTools, SchemaCache, default_cache_dir
-from mcp_to_cli_kit.client import PortalProvider, ServerClient, ServerRejectedError, TransportError
 from mcp_to_cli_kit.client_defaults import (
     DEFAULT_RETRY_DELAYS,
     KIT_DISTRIBUTION,
@@ -50,20 +52,27 @@ from mcp_to_cli_kit.config import (
     check_consumer_keys,
     config_path_variable,
     default_config_path,
+    expand_url,
     load_config,
 )
 from mcp_to_cli_kit.lazy import EXIT_INTERRUPTED as EXIT_INTERRUPTED
 from mcp_to_cli_kit.lazy import LazyKitGroup, _standalone, run
 from mcp_to_cli_kit.logs import configure_logging
-from mcp_to_cli_kit.oauth import AuthError, AuthTransportError, TokenStore, default_token_dir
 from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
 
 if TYPE_CHECKING:
     from click.shell_completion import CompletionItem
 
+if TYPE_CHECKING:
+    from mcp import types
+
+    from mcp_to_cli_kit.client import PortalProvider, ServerClient
+    from mcp_to_cli_kit.oauth import TokenStore
+
 logger = logging.getLogger(__name__)
 
-ResultClassifier = Callable[[str, str, types.CallToolResult], bool]
+# The result type is a string, so the alias exists at run time without importing the SDK.
+ResultClassifier = Callable[[str, str, "types.CallToolResult"], bool]
 """Called with the server name, the tool name and a result the server did not mark as an error.
 
 Returning True treats the result as an error: it is printed to stderr and the exit code is 1.
@@ -352,16 +361,21 @@ class TopLevelListing:
 
 @dataclass
 class Runtime:
-    """The state of one invocation: the config, the clients and the tool lists."""
+    """The state of one invocation: the config, the clients and the tool lists.
+
+    The clients, the token store and the event loop behind them are created on first use, so an
+    invocation that never contacts a server never imports the MCP SDK.
+    """
 
     app: App
     loaded: LoadedConfig
     refresh: bool
     command_path: str = ""
     """How the user calls the kit group, such as ``host mcp`` when it is mounted under a host CLI; for hints."""
-    portal: PortalProvider = field(default_factory=PortalProvider)
     clients: dict[str, ServerClient] = field(default_factory=dict)
     cache: SchemaCache = field(init=False)
+    _portal: PortalProvider | None = None
+    _tokens: TokenStore | None = None
     _tools: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _live: set[str] = field(default_factory=set)
     _indexes: dict[str, ServerTools] = field(default_factory=dict)
@@ -370,21 +384,36 @@ class Runtime:
     def __post_init__(self) -> None:
         self.command_path = self.command_path or self.app.bin_name
         self.cache = SchemaCache(default_cache_dir(self.app.bin_name))
-        self.tokens = TokenStore(default_token_dir(self.app.bin_name))
-        version = self.app.bin_version
-        header = client_header_value(self.app.bin_name, version)
-        client_info = types.Implementation(name=self.app.bin_name, version=version)
-        for name, server in self.loaded.config.servers.items():
-            self.clients[name] = ServerClient(
-                name,
+
+    @property
+    def tokens(self) -> TokenStore:
+        if self._tokens is None:
+            from mcp_to_cli_kit.oauth import TokenStore, default_token_dir
+
+            self._tokens = TokenStore(default_token_dir(self.app.bin_name))
+        return self._tokens
+
+    def client(self, server: str) -> ServerClient:
+        """The client of a server, created on first use."""
+        if server not in self.clients:
+            from mcp import types
+
+            from mcp_to_cli_kit.client import PortalProvider, ServerClient
+
+            if self._portal is None:
+                self._portal = PortalProvider()
+            version = self.app.bin_version
+            self.clients[server] = ServerClient(
                 server,
-                header,
-                self.portal,
+                self.config.servers[server],
+                client_header_value(self.app.bin_name, version),
+                self._portal,
                 self.app.retry_delays,
-                client_info=client_info,
+                client_info=types.Implementation(name=self.app.bin_name, version=version),
                 token_store=self.tokens,
-                login_command=self.login_command(name),
+                login_command=self.login_command(server),
             )
+        return self.clients[server]
 
     def check_extra_commands(self) -> None:
         """Fail when a group mount or a top-level tool group takes the name of one of the consumer's extra commands."""
@@ -407,7 +436,8 @@ class Runtime:
     def close(self) -> None:
         for client in self.clients.values():
             client.close()
-        self.portal.__exit__(None, None, None)
+        if self._portal is not None:
+            self._portal.__exit__(None, None, None)
         # The expanded secrets of this invocation; a later one in the same process registers its own.
         redaction.clear()
 
@@ -423,7 +453,10 @@ class Runtime:
         return self._fetch(server, fallback=cached.tools if cached is not None else None)
 
     def _fetch(self, server: str, fallback: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-        client = self.clients[server]
+        from mcp_to_cli_kit.client import ServerRejectedError, TransportError
+        from mcp_to_cli_kit.oauth import AuthError
+
+        client = self.client(server)
         self._live.add(server)
         try:
             tools = client.list_tools()
@@ -446,8 +479,12 @@ class Runtime:
         return tools
 
     def _load_cache(self, server: str) -> CachedTools | None:
-        client = self.clients[server]
-        return self.cache.load(server, client.server.url, client.cache_url())
+        """The cache entry of a server, told apart by its URL; reading it needs no client."""
+        client = self.clients.get(server)
+        if client is not None:
+            return self.cache.load(server, client.server.url, client.cache_url())
+        config = self.config.servers[server]
+        return self.cache.load(server, config.url, expand_url(config))
 
     def server_tools(self, server: str) -> ServerTools:
         """A server's tools by their command name within the server, without any mount prefix."""
@@ -1261,6 +1298,8 @@ class AuthGroup(click.Group):
     HELP = "Sign in to the servers that use OAuth, sign out, or show the sign-in state."
 
     def __init__(self) -> None:
+        from mcp_to_cli_kit.oauth import DEFAULT_LOGIN_TIMEOUT_SECONDS
+
         super().__init__(name=self.NAME, help=self.HELP, no_args_is_help=True)
         server = click.Argument(["server"], required=False, metavar="[SERVER]")
         self.add_command(
@@ -1282,7 +1321,7 @@ class AuthGroup(click.Group):
                     click.Option(
                         ["--timeout"],
                         type=click.FloatRange(min=1),
-                        default=oauth.DEFAULT_LOGIN_TIMEOUT_SECONDS,
+                        default=DEFAULT_LOGIN_TIMEOUT_SECONDS,
                         show_default=True,
                         help="Seconds to wait for the sign-in in the browser.",
                     ),
@@ -1347,7 +1386,7 @@ def _oauth_targets(server: str | None) -> tuple[Runtime, list[str]]:
 
 def _resolved(runtime: Runtime, name: str) -> ResolvedServer:
     try:
-        resolved = runtime.clients[name].resolve()
+        resolved = runtime.client(name).resolve()
     except ConfigError as error:
         raise ConfigFailure(str(error)) from error
     assert resolved.auth is not None
@@ -1355,6 +1394,9 @@ def _resolved(runtime: Runtime, name: str) -> ResolvedServer:
 
 
 def _login(server: str | None, no_browser: bool, timeout: float) -> None:
+    from mcp_to_cli_kit import oauth
+    from mcp_to_cli_kit.oauth import AuthError, AuthTransportError
+
     runtime, names = _oauth_targets(server)
     for name in names:
         resolved = _resolved(runtime, name)
@@ -1379,6 +1421,9 @@ def _login(server: str | None, no_browser: bool, timeout: float) -> None:
 
 
 def _logout(server: str | None, revoke: bool) -> None:
+    from mcp_to_cli_kit import oauth
+    from mcp_to_cli_kit.oauth import AuthError, AuthTransportError
+
     runtime, names = _oauth_targets(server)
     for name in names:
         tokens = runtime.tokens.load(name)
@@ -1480,8 +1525,11 @@ class ToolCommand(click.Command):
             invalid = click.UsageError("invalid arguments:\n  " + "\n  ".join(problems), ctx)
             raise self._with_summary(invalid, ctx)
 
+        from mcp_to_cli_kit.client import ServerRejectedError, TransportError
+        from mcp_to_cli_kit.oauth import AuthError
+
         runtime = _runtime(ctx)
-        client = runtime.clients[self.entry.server]
+        client = runtime.client(self.entry.server)
         logger.debug("Calling %s on %s with %s", self.entry.name, self.entry.server, arguments)
         try:
             result = client.call_tool(self.entry.name, arguments)
@@ -1511,6 +1559,8 @@ class ToolCommand(click.Command):
 
 
 def _first_text(result: types.CallToolResult) -> str:
+    from mcp import types
+
     for item in result.content:
         if isinstance(item, types.TextContent):
             return item.text

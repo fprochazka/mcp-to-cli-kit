@@ -63,7 +63,6 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-import httpx
 import yaml
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -420,6 +419,8 @@ def _register_secrets(server: ServerConfig, url: str, environ: Mapping[str, str]
         for variable in template_variables(value):
             redaction.register_encoded(environ[variable], "${" + variable + "}")
 
+    import httpx  # here, not at the top: loading the config must not import httpx
+
     parts = urlsplit(url)
     userinfo = parts.netloc.rpartition("@")[0]
     secrets = [userinfo, userinfo.partition(":")[2], parts.query, parts.fragment]
@@ -449,6 +450,8 @@ def _literal_header_text(value: str) -> list[str]:
 def _check_expanded_url(name: str, template: str, url: str, variables: list[str], environ: Mapping[str, str]) -> None:
     if not variables:
         return  # checked when the config was loaded
+    import httpx
+
     prefix = f"Server {name}: url, once {', '.join(variables)} {'is' if len(variables) == 1 else 'are'} expanded,"
     template_scheme = template.partition("://")[0] if "://" in template else "${"
     try:

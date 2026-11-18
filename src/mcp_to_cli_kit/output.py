@@ -18,11 +18,12 @@ Which content is printed:
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
-
-from mcp import types
+from typing import TYPE_CHECKING, Any, Literal
 
 from mcp_to_cli_kit.agent import detect_agent
+
+if TYPE_CHECKING:
+    from mcp import types
 
 OutputMode = Literal["machine", "pretty"]
 
@@ -37,6 +38,9 @@ def resolve_mode(*flags: OutputMode | None) -> OutputMode:
 
 def render(result: types.CallToolResult, mode: OutputMode) -> str:
     """The text to print for a result, without the trailing newline decision."""
+    # Here, not at the top: choosing the output mode must not import the SDK.
+    from mcp import types
+
     content = list(result.content)
     structured = result.structuredContent
     if structured is not None and not _content_is_serialized(content, structured):
@@ -88,6 +92,8 @@ def _reject_constant(name: str) -> Any:
 
 
 def _content_is_serialized(content: list[types.ContentBlock], structured: dict[str, Any]) -> bool:
+    from mcp import types
+
     if len(content) != 1 or not isinstance(content[0], types.TextContent):
         return False
     text = content[0].text
@@ -105,6 +111,8 @@ def _item_json(item: types.ContentBlock) -> Any:
 
 
 def _machine_array_item(item: types.ContentBlock) -> str:
+    from mcp import types
+
     if isinstance(item, types.TextContent):
         if _try_json(item.text) is not _NOT_JSON:
             return item.text.strip()
@@ -113,6 +121,8 @@ def _machine_array_item(item: types.ContentBlock) -> str:
 
 
 def _pretty_array_item(item: types.ContentBlock) -> Any:
+    from mcp import types
+
     if isinstance(item, types.TextContent):
         parsed = _try_json(item.text)
         return item.text if parsed is _NOT_JSON else parsed
