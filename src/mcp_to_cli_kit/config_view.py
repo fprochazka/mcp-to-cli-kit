@@ -16,21 +16,14 @@ are shown as written and never expanded, so no value from the environment is eve
 
 from __future__ import annotations
 
-import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from mcp_to_cli_kit.config import LoadedConfig, VariableReference, parse_template
+from mcp_to_cli_kit.config import AUTH_SCHEME, SHOWN_HEADERS, LoadedConfig, VariableReference, parse_template
 
 MASK = "***"
 
 REVEAL_MIN_LENGTH = 12
-
-# Headers whose values are shown as written; every other header value is masked.
-SHOWN_HEADERS = frozenset({"accept", "content-type", "user-agent", "x-mcp-client"})
-
-# A known auth scheme word at the start of a header value, followed by whitespace and more text.
-_AUTH_SCHEME = re.compile(r"^((?:Bearer|Basic|Token|Digest|Bot|ApiKey)[ \t]+)(.*)$", re.IGNORECASE | re.DOTALL)
 
 
 def mask(value: str) -> str:
@@ -64,7 +57,7 @@ def _mask_template(value: str, *, keep_scheme: bool = False) -> str:
     parts = parse_template(value)
     shown = []
     first = parts[0] if parts else None
-    if keep_scheme and isinstance(first, str) and (scheme := _AUTH_SCHEME.match(first)):
+    if keep_scheme and isinstance(first, str) and (scheme := AUTH_SCHEME.match(first)):
         rest = [scheme.group(2), *parts[1:]]
         if any(rest):  # the word alone stays masked: it may be the whole secret
             shown.append(scheme.group(1))

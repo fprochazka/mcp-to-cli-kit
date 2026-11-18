@@ -509,6 +509,43 @@ class TestWhatIsRegistered:
 
         assert SECRET not in redaction.redact(f"{SECRET}-pw {SECRET}-hdr u:{SECRET}-pw {SECRET}-frag")
 
+    def test_literal_header_values_are_registered(self) -> None:
+        server = ServerConfig(
+            url=URL,
+            headers={
+                "Authorization": f"Bearer {SECRET}-hdr",
+                "X-Org-Id": f"org-{SECRET}",
+                "X-Api-Key": f"key-{SECRET}-${{EXAMPLE_TOKEN}}",
+                "Accept": "application/json, text/event-stream",
+                "User-Agent": "agent-0001",
+            },
+        )
+
+        expand_server("alpha", server, {"EXAMPLE_TOKEN": "tail-value"})
+
+        assert redaction.redact(f"a {SECRET}-hdr b org-{SECRET} c key-{SECRET}-") == "a *** b *** c ***"
+        assert redaction.redact("Bearer application/json, text/event-stream agent-0001") == (
+            "Bearer application/json, text/event-stream agent-0001"
+        )
+
+    def test_a_scheme_word_before_a_variable_is_not_registered(self) -> None:
+        server = ServerConfig(url=URL, headers={"Authorization": "Bearer ${EXAMPLE_TOKEN}"})
+
+        expand_server("alpha", server, {"EXAMPLE_TOKEN": SECRET})
+
+        assert redaction.redact(f"Bearer {SECRET}") == "Bearer ${EXAMPLE_TOKEN}"
+
+    def test_minus_vv_shows_no_literal_header_value(self, invoke: Invoke, json_server: RunningServer) -> None:
+        default = {"servers": {"example": {"url": json_server.url, "headers": {"Authorization": f"Bearer {SECRET}"}}}}
+
+        # The secret also travels as an argument, so the log has a line that would show it.
+        result = invoke(["-vv", "search-items", "--query", SECRET], default=default)
+
+        assert result.exit_code == 0, result.stderr
+        assert "Calling search_items" in result.stderr
+        assert SECRET not in result.stderr
+        assert authorizations(json_server) == {f"Bearer {SECRET}"}
+
     def test_the_runtime_forgets_them_when_it_closes(self, invoke: Invoke, json_server: RunningServer) -> None:
         url = f"{json_server.url}?token=${{EXAMPLE_TOKEN}}"
 

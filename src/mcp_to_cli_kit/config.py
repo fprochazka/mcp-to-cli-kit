@@ -79,6 +79,12 @@ COMMAND_NAME_PATTERN = r"^[a-z0-9][a-z0-9_-]*$"
 # "-tool" suffix.
 BUILTIN_COMMANDS = frozenset({"schema", "config", "auth"})
 
+# Headers whose values are no secret: ``config`` shows them as written, and the log does not redact them.
+SHOWN_HEADERS = frozenset({"accept", "content-type", "user-agent", "x-mcp-client"})
+
+# A known auth scheme word at the start of a header value, followed by whitespace and more text.
+AUTH_SCHEME = re.compile(r"^((?:Bearer|Basic|Token|Digest|Bot|ApiKey)[ \t]+)(.*)$", re.IGNORECASE | re.DOTALL)
+
 
 def _not_builtin(name: str) -> str:
     if name in BUILTIN_COMMANDS:
@@ -386,7 +392,16 @@ def _register_secrets(server: ServerConfig, url: str, environ: Mapping[str, str]
     Those are the values of the variables in the headers, the userinfo, the query and the
     fragment, and the userinfo, password, query and fragment of the expanded URL. The fragment is
     never sent, but the SDK and httpx log it. Host, port and path are left alone.
+
+    The literal text of a header value is registered too, except for the headers in
+    ``SHOWN_HEADERS`` and a leading auth scheme word such as ``Bearer``, because a consumer or a
+    config file may write a token into the header itself rather than through a variable.
     """
+    for header, value in server.headers.items():
+        if header.lower() not in SHOWN_HEADERS:
+            for literal in _literal_header_text(value):
+                redaction.register_encoded(literal, "***")
+
     template = urlsplit(server.url)
     secret_templates = [*server.headers.values()]
     if template.scheme and template.netloc:
@@ -406,6 +421,19 @@ def _register_secrets(server: ServerConfig, url: str, environ: Mapping[str, str]
     ]
     for secret in secrets:
         redaction.register_encoded(secret, "***")
+
+
+def _literal_header_text(value: str) -> list[str]:
+    """The literal parts of a header value template, without a leading auth scheme word and surrounding blanks."""
+    literals = []
+    for index, part in enumerate(parse_template(value)):
+        if not isinstance(part, str):
+            continue
+        if index == 0 and (scheme := AUTH_SCHEME.match(part)):
+            part = scheme.group(2)
+        if part.strip():
+            literals.append(part.strip())
+    return literals
 
 
 def _check_expanded_url(name: str, template: str, url: str, variables: list[str], environ: Mapping[str, str]) -> None:

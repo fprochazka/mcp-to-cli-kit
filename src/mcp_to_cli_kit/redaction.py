@@ -1,12 +1,13 @@
 """Keep expanded secrets out of error messages and logs.
 
-When a server's ``${NAME}`` references are expanded, the parts that carry secrets are
-registered here with the text that replaces them: the values of the variables in its headers,
-userinfo, query and fragment (replaced by the ``${NAME}`` they came from), and the userinfo,
-password, query and fragment of the expanded URL (replaced by ``***``). Each is also registered in the percent-encoded
-forms a URL log line shows. Host, port and path values are not secrets and are not registered.
-Error messages of the transport and every log record written through the kit's handlers,
-``-vv`` included, pass through ``redact``.
+When a server's ``${NAME}`` references are expanded, the parts that carry secrets are registered
+here with the text that replaces them: the values of the variables in its headers, userinfo,
+query and fragment (replaced by the ``${NAME}`` they came from), and the userinfo, password,
+query and fragment of the expanded URL (replaced by ``***``), and the literal text of the header
+values that are not in ``config.SHOWN_HEADERS`` (also ``***``). Each is also registered in the
+percent-encoded forms a URL log line shows. Host, port and path values are not secrets and are
+not registered. Error messages of the transport and every log record written through the kit's
+handlers, ``-vv`` included, pass through ``redact``.
 
 Values shorter than ``MIN_LENGTH`` are not registered: replacing every ``1`` or ``a`` in a
 message would make it unreadable, and such a value is no secret.
