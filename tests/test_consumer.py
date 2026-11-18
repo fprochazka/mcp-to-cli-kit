@@ -15,6 +15,7 @@ from fixture_server import RunningServer
 
 from mcp_to_cli_kit.cli import build_cli
 from mcp_to_cli_kit.config import ConfigError, default_config_path
+from mcp_to_cli_kit.output import echo_json, mode_options
 
 SECRET = "acct-s3cr3t-key-value"
 
@@ -308,3 +309,35 @@ class TestConsumerConfig:
     def test_a_kit_key_cannot_be_a_consumer_key(self, key: str) -> None:
         with pytest.raises(ValueError, match="kit's own keys"):
             build_cli(BIN, {"servers": {"example": {"url": "https://mcp.example.com/mcp"}}}, consumer_keys=[key])
+
+
+@click.command("accounts", help="Print the accounts as JSON.", params=mode_options())
+@click.pass_context
+def accounts_command(ctx: click.Context, machine_output: bool, pretty_output: bool) -> None:
+    echo_json(ctx, {"accounts": ["work", "příští"]})
+
+
+class TestConsumerOutput:
+    @pytest.mark.parametrize(
+        ("args", "env", "expected"),
+        [
+            (["--json", "accounts"], None, '{"accounts": ["work", "příští"]}\n'),
+            (["accounts", "--json"], None, '{"accounts": ["work", "příští"]}\n'),
+            (["accounts"], {"CLAUDECODE": "1"}, '{"accounts": ["work", "příští"]}\n'),
+            (["accounts"], None, '{\n  "accounts": [\n    "work",\n    "příští"\n  ]\n}\n'),
+            (["--json", "accounts", "--pretty"], None, '{\n  "accounts": [\n    "work",\n    "příští"\n  ]\n}\n'),
+        ],
+    )
+    def test_echo_json_follows_the_output_flags(
+        self, json_server: RunningServer, args: list[str], env: dict[str, str] | None, expected: str
+    ) -> None:
+        result = run(json_server, args, env=env, extra_commands=[accounts_command])
+
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout == expected
+
+    def test_both_flags_at_one_level_are_a_usage_error(self, json_server: RunningServer) -> None:
+        result = run(json_server, ["accounts", "--json", "--pretty"], extra_commands=[accounts_command])
+
+        assert result.exit_code == 2
+        assert "--json and --pretty exclude each other." in result.stderr

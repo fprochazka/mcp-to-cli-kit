@@ -58,7 +58,7 @@ from mcp_to_cli_kit.config import (
 from mcp_to_cli_kit.lazy import EXIT_INTERRUPTED as EXIT_INTERRUPTED
 from mcp_to_cli_kit.lazy import LazyKitGroup, _standalone, run
 from mcp_to_cli_kit.logs import configure_logging
-from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
+from mcp_to_cli_kit.output import context_flags, finish, mode_options, render, resolve_mode
 
 if TYPE_CHECKING:
     from click.shell_completion import CompletionItem
@@ -796,41 +796,6 @@ def _version_callback(ctx: click.Context, param: click.Parameter, value: bool) -
     ctx.exit(0)
 
 
-def _mode_options() -> list[click.Option]:
-    return [
-        click.Option(
-            ["--json", "machine_output"],
-            is_flag=True,
-            default=False,
-            help="Machine output: print the server's result exactly as sent, as under an AI agent.",
-        ),
-        click.Option(
-            ["--pretty", "pretty_output"],
-            is_flag=True,
-            default=False,
-            help="Pretty output: indent JSON results. The default unless an AI agent is detected.",
-        ),
-    ]
-
-
-def _mode(ctx: click.Context) -> OutputMode | None:
-    machine = bool(ctx.params.get("machine_output"))
-    pretty = bool(ctx.params.get("pretty_output"))
-    if machine and pretty:
-        raise click.UsageError("--json and --pretty exclude each other.", ctx)
-    return "machine" if machine else "pretty" if pretty else None
-
-
-def _modes(ctx: click.Context) -> list[OutputMode | None]:
-    """The output-mode flags from the tool's own options outwards, the innermost first."""
-    modes = []
-    current: click.Context | None = ctx
-    while current is not None:
-        modes.append(_mode(current))
-        current = current.parent
-    return modes
-
-
 def _kit_context(ctx: click.Context) -> tuple[click.Context, KitGroup]:
     """The context of the nearest ``KitGroup`` around a command: the root, or a host CLI's subcommand."""
     current: click.Context | None = ctx
@@ -955,7 +920,7 @@ class KitGroup(_CompletingGroup):
                 is_eager=True,
                 help="Fetch the tool lists of the servers the command uses, ignoring the cache (kept for an hour).",
             ),
-            *_mode_options(),
+            *mode_options(),
             click.Option(
                 ["--version"],
                 is_flag=True,
@@ -1111,7 +1076,7 @@ class MountGroup(_CompletingGroup):
 
     def __init__(self, server: str, name: str, mount: Any) -> None:
         help_text = getattr(mount, "help", None) or f"The tools of the {server} server."
-        super().__init__(name=name, help=help_text, params=_mode_options(), no_args_is_help=True)
+        super().__init__(name=name, help=help_text, params=mode_options(), no_args_is_help=True)
         self.server = server
 
     def list_commands(self, ctx: click.Context) -> list[str]:
@@ -1152,7 +1117,7 @@ class ToolGroupCommand(_CompletingGroup):
 
     def __init__(self, server: str, tool_group: ToolGroup, name: str) -> None:
         super().__init__(
-            name=name, help=_tool_group_help(server, tool_group), params=_mode_options(), no_args_is_help=True
+            name=name, help=_tool_group_help(server, tool_group), params=mode_options(), no_args_is_help=True
         )
         self.server = server
         self.tool_group = tool_group.group
@@ -1190,7 +1155,7 @@ class SchemaCommand(click.Command):
         super().__init__(
             name=self.NAME,
             help=f"{self.HELP} TOOL is any name the tool's own command accepts.",
-            params=[click.Argument(["tool"], metavar="TOOL"), *_mode_options()],
+            params=[click.Argument(["tool"], metavar="TOOL"), *mode_options()],
         )
 
     def invoke(self, ctx: click.Context) -> None:
@@ -1212,7 +1177,7 @@ class SchemaCommand(click.Command):
             raise click.UsageError(f"No such tool {name!r}.{hint}", ctx)
 
         schema = target.entry.tool.get("inputSchema") or {}
-        mode = resolve_mode(*_modes(ctx))
+        mode = resolve_mode(*context_flags(ctx))
         indent = 2 if mode == "pretty" else None
         _write(json.dumps(schema, ensure_ascii=False, indent=indent) + "\n", "stdout")
 
@@ -1276,12 +1241,12 @@ class ConfigCommand(click.Command):
                 "variable prefix and the names of the environment variables that were applied. "
                 "${NAME} references are shown unexpanded. Nothing is sent to any server."
             ),
-            params=[*_mode_options()],
+            params=[*mode_options()],
         )
 
     def invoke(self, ctx: click.Context) -> None:
         loaded = _load(*_kit_context(ctx))
-        mode = resolve_mode(*_modes(ctx))
+        mode = resolve_mode(*context_flags(ctx))
         indent = 2 if mode == "pretty" else None
         _write(json.dumps(config_view.describe(loaded), ensure_ascii=False, indent=indent) + "\n", "stdout")
 
@@ -1363,7 +1328,7 @@ class AuthGroup(click.Group):
                         is_flag=True,
                         help="Also print when each token expires, the scopes, the client, the issuer, the token file.",
                     ),
-                    *_mode_options(),
+                    *mode_options(),
                 ],
             )
         )
@@ -1477,7 +1442,7 @@ def _status(server: str | None, full: bool, machine_output: bool, pretty_output:
             }
         servers.append(entry)
     # The short status fits one line for a person too; the full one is long enough to read only indented.
-    mode = resolve_mode(*_modes(ctx), "pretty" if full else "machine")
+    mode = resolve_mode(*context_flags(ctx), "pretty" if full else "machine")
     _write(json.dumps({"servers": servers}, indent=2 if mode == "pretty" else None) + "\n", "stdout")
     if not all(entry["signed_in"] for entry in servers):
         ctx.exit(EXIT_AUTH)
@@ -1499,7 +1464,7 @@ class ToolCommand(click.Command):
             help_text += "\n\nReturns JSON: the tool declares an output schema."
         super().__init__(
             name=entry.command,
-            params=[*self.compiled.options(), *_mode_options()],
+            params=[*self.compiled.options(), *mode_options()],
             help=help_text or None,
             no_args_is_help=False,
         )
@@ -1515,7 +1480,7 @@ class ToolCommand(click.Command):
         return click.UsageError(f"{error.format_message()}\n\n{self.compiled.summary()}", error.ctx or ctx)
 
     def invoke(self, ctx: click.Context) -> None:
-        mode = resolve_mode(*_modes(ctx))
+        mode = resolve_mode(*context_flags(ctx))
         try:
             arguments = self.compiled.arguments(ctx.params)
         except click.UsageError as error:

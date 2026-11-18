@@ -5,6 +5,9 @@ written byte for byte, and no newline is added unless stdout is a terminal. Pret
 re-indents JSON with ``indent=2`` and keeps non-ASCII characters readable; text that is not
 JSON is printed as it is. Nothing here wraps lines, in either mode.
 
+A consumer's own commands print JSON in the same modes through ``echo_json``; ``mode_options``
+gives them their own ``--json`` and ``--pretty``, and the bin's global ones apply too.
+
 Which content is printed:
 
 - One item: that item. A text item is its text; any other item is its JSON form.
@@ -20,6 +23,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, Literal
 
+import click
+
 from mcp_to_cli_kit.agent import detect_agent
 
 if TYPE_CHECKING:
@@ -34,6 +39,57 @@ def resolve_mode(*flags: OutputMode | None) -> OutputMode:
         if flag is not None:
             return flag
     return "machine" if detect_agent() is not None else "pretty"
+
+
+def mode_options() -> list[click.Option]:
+    """``--json`` and ``--pretty`` for a command; ``context_mode`` reads them from it and from its parents."""
+    return [
+        click.Option(
+            ["--json", "machine_output"],
+            is_flag=True,
+            default=False,
+            help="Machine output: print the server's result exactly as sent, as under an AI agent.",
+        ),
+        click.Option(
+            ["--pretty", "pretty_output"],
+            is_flag=True,
+            default=False,
+            help="Pretty output: indent JSON results. The default unless an AI agent is detected.",
+        ),
+    ]
+
+
+def context_flags(ctx: click.Context) -> list[OutputMode | None]:
+    """The ``--json`` / ``--pretty`` flags of a command and of the groups above it, the innermost first.
+
+    Raises:
+        click.UsageError: Both flags were given at the same level.
+    """
+    flags: list[OutputMode | None] = []
+    current: click.Context | None = ctx
+    while current is not None:
+        machine = bool(current.params.get("machine_output"))
+        pretty = bool(current.params.get("pretty_output"))
+        if machine and pretty:
+            raise click.UsageError("--json and --pretty exclude each other.", current)
+        flags.append("machine" if machine else "pretty" if pretty else None)
+        current = current.parent
+    return flags
+
+
+def context_mode(ctx: click.Context) -> OutputMode:
+    """A command's output mode: its own or a parent's ``--json`` / ``--pretty``, else what ``resolve_mode`` picks."""
+    return resolve_mode(*context_flags(ctx))
+
+
+def echo_json(ctx: click.Context, value: Any) -> None:
+    """Print a JSON value on stdout in the command's output mode: compact in machine mode, indented otherwise.
+
+    For a consumer's own commands, so they follow the bin's ``--json`` and ``--pretty`` like the
+    built-in ones. Non-ASCII text is kept readable and written as UTF-8.
+    """
+    indent = 2 if context_mode(ctx) == "pretty" else None
+    click.echo((json.dumps(value, ensure_ascii=False, indent=indent) + "\n").encode("utf-8"), nl=False)
 
 
 def render(result: types.CallToolResult, mode: OutputMode) -> str:
