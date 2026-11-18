@@ -9,6 +9,8 @@ What is masked, the same parts the log redaction treats as secrets:
   scheme, host, port and path are shown;
 - the literal text of ``auth.client_secret``. The client id is shown.
 
+The consumer's own keys of the file are listed by name only, never with their values.
+
 A masked value becomes ``***`` followed by its last 4 characters, or only ``***`` when it is
 shorter than ``REVEAL_MIN_LENGTH``, so a short secret is not half shown. ``${NAME}`` references
 are shown as written and never expanded, so no value from the environment is ever printed.
@@ -43,13 +45,17 @@ def describe(loaded: LoadedConfig) -> dict[str, Any]:
         auth = server.get("auth")
         if isinstance(auth, dict) and isinstance(auth.get("client_secret"), str):
             auth["client_secret"] = _mask_template(auth["client_secret"])
-    return {
+    described: dict[str, Any] = {
         "config_file": str(loaded.path),
         "config_file_loaded": loaded.file_loaded,
         "env_prefix": loaded.env_prefix,
         "env_applied": list(loaded.env_applied),
-        "config": config,
     }
+    if loaded.consumer_keys:
+        # By name only: the consumer's own settings may hold secrets the kit knows nothing about.
+        described["consumer_keys"] = sorted(loaded.consumer)
+    described["config"] = config
+    return described
 
 
 def _mask_template(value: str, *, keep_scheme: bool = False) -> str:

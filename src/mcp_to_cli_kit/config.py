@@ -39,6 +39,12 @@ environment variables as ``${NAME}`` (``$${`` gives a literal ``${``; a ``$`` no
 only when a server is contacted, so an unset variable fails only the commands that need that
 server. See ``expand_server``.
 
+A consumer may keep settings of its own in the same file, as top-level keys it names
+(``consumer_keys``). They are split off before validation, never read from the environment, and
+handed to the consumer's ``layer``, which computes a config layer from them, such as the headers
+of a selected account. That layer sits between the code default and the file's own keys, so the
+file and the environment still override it.
+
 Environment variables cannot add a server, only change one the default or the file defines.
 A variable that names no configured server or no known key is ignored and logged at debug
 level, so a short prefix does not break the CLI over an unrelated variable. A known server
@@ -51,8 +57,8 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Set
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
@@ -504,6 +510,8 @@ class LoadedConfig:
         file_loaded: Whether that file existed and was read.
         env_prefix: The prefix of the environment variables that were applied.
         env_applied: The names of the environment variables that were applied, sorted.
+        consumer_keys: The top-level keys the consumer reads itself, as declared, sorted.
+        consumer: Those of them the config file holds, with their values. May hold secrets.
     """
 
     bin_name: str
@@ -512,6 +520,8 @@ class LoadedConfig:
     file_loaded: bool
     env_prefix: str
     env_applied: tuple[str, ...] = ()
+    consumer_keys: tuple[str, ...] = ()
+    consumer: Mapping[str, Any] = field(default_factory=dict)
 
 
 def default_config_path(bin_name: str) -> Path:
@@ -544,6 +554,20 @@ def config_path_variable(bin_name: str) -> str:
     return env_prefix_for(bin_name) + CONFIG_PATH_KEY
 
 
+ConfigLayerFunction = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+"""Computes a config layer, in the shape of the file, from the consumer's own keys of the file."""
+
+# The top-level keys of the kit's own configuration, which a consumer cannot claim.
+KIT_KEYS = frozenset(CliConfig.model_fields)
+
+
+def check_consumer_keys(keys: Set[str]) -> None:
+    """Raise ValueError when a consumer key is one of the kit's own top-level keys."""
+    taken = sorted(set(keys) & KIT_KEYS)
+    if taken:
+        raise ValueError(f"Consumer config keys must not be the kit's own keys: {', '.join(taken)}.")
+
+
 def load_config(
     bin_name: str,
     *,
@@ -552,8 +576,10 @@ def load_config(
     environ: Mapping[str, str] | None = None,
     env_prefix: str | None = None,
     command: str | None = None,
+    consumer_keys: Set[str] = frozenset(),
+    layer: ConfigLayerFunction | None = None,
 ) -> LoadedConfig:
-    """Merge the code default, the config file and the environment, and validate the result.
+    """Merge the code default, the consumer's layer, the config file and the environment, and validate the result.
 
     Args:
         bin_name: The executable's name.
@@ -563,13 +589,21 @@ def load_config(
         env_prefix: Overrides the prefix derived from the bin name.
         command: How the user calls the CLI, such as ``host mcp`` when it is mounted under a host
             CLI, for the error messages; the bin name when None.
+        consumer_keys: Top-level keys of the file that the consumer reads itself. They are taken
+            out of the file before validation and never read from the environment.
+        layer: Called once with the consumer keys the file holds (an empty mapping without a
+            file); its result is merged over the code default and under the file's own keys. It
+            may raise ConfigError.
 
     Returns:
         The validated configuration.
 
     Raises:
-        ConfigError: The file is missing or malformed, or the merged configuration is invalid.
+        ConfigError: The file is missing or malformed, the merged configuration is invalid, or
+            the layer raised it.
+        ValueError: A consumer key is one of the kit's own keys.
     """
+    check_consumer_keys(consumer_keys)
     path = resolve_config_path(bin_name, config_path)
     prefix = env_prefix if env_prefix is not None else env_prefix_for(bin_name)
     environ = os.environ if environ is None else environ
@@ -579,11 +613,16 @@ def load_config(
     if path.is_dir():
         raise ConfigError(f"Config path {path} is a directory, not a file.")
     file_loaded = path.is_file()
+    file_layer = _read_file(path) if file_loaded else {}
+    consumer = {key: file_layer.pop(key) for key in sorted(consumer_keys) if key in file_layer}
+    computed = layer(consumer) if layer is not None else {}
+    if computed:
+        merged = _merge_config(merged, computed)
     if file_loaded:
-        merged = _merge_config(merged, _read_file(path))
+        merged = _merge_config(merged, file_layer)
     elif config_path is not None and str(config_path) != "":
         raise ConfigError(f"Config file {path} does not exist.")
-    elif default is None:
+    elif default is None and not computed:
         raise ConfigError(
             f"{command or bin_name} has no configuration. Create {path} with at least one server, for example:\n\n"
             + yaml.safe_dump({"servers": {"example": {"url": "https://mcp.example.com/mcp"}}}, sort_keys=False)
@@ -596,6 +635,8 @@ def load_config(
         config = CliConfig.model_validate(merged)
     except ValidationError as error:
         sources = ["the built-in default"] if default is not None else []
+        if computed:
+            sources.append(f"the config computed from {', '.join(sorted(consumer_keys))}")
         if file_loaded:
             sources.append(str(path))
         sources.append(f"{prefix}* environment variables")
@@ -608,6 +649,8 @@ def load_config(
         file_loaded=file_loaded,
         env_prefix=prefix,
         env_applied=tuple(sorted(applied)),
+        consumer_keys=tuple(sorted(consumer_keys)),
+        consumer=consumer,
     )
 
 

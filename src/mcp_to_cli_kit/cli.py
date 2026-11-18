@@ -19,7 +19,7 @@ import json
 import logging
 import re
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +50,7 @@ from mcp_to_cli_kit.config import (
     PrefixMount,
     ResolvedServer,
     ToolGroup,
+    check_consumer_keys,
     config_path_variable,
     default_config_path,
     load_config,
@@ -70,6 +71,14 @@ ResultClassifier = Callable[[str, str, types.CallToolResult], bool]
 
 Returning True treats the result as an error: it is printed to stderr and the exit code is 1.
 For servers that report failures as ordinary text.
+"""
+
+ConfigLayer = Callable[[click.Context, Mapping[str, Any]], Mapping[str, Any]]
+"""Called once per invocation with the bin's group context and the consumer keys the config file holds.
+
+Returns a config layer in the shape of the file, merged over the code default and under the file's
+own keys and the environment. The context's ``params`` hold the global options, the consumer's
+``extra_params`` included. Raising ``ConfigError`` ends the command with exit code 2.
 """
 
 EXIT_TOOL_ERROR = 1
@@ -130,6 +139,8 @@ class App:
     retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS
     extra_params: tuple[click.Parameter, ...] = ()
     extra_commands: tuple[click.Command, ...] = ()
+    consumer_keys: frozenset[str] = frozenset()
+    config_layer: ConfigLayer | None = None
 
     @property
     def bin_version(self) -> str:
@@ -658,6 +669,8 @@ def build_cli(
     retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS,
     extra_params: Sequence[click.Parameter] = (),
     extra_commands: Sequence[click.Command] = (),
+    consumer_keys: Iterable[str] = (),
+    config_layer: ConfigLayer | None = None,
 ) -> click.Group:
     """Build the click group of a kit CLI.
 
@@ -675,8 +688,13 @@ def build_cli(
             built-ins and the tools. They run without loading the config or the tool lists. A tool
             whose command would take one of their names gets a ``-tool`` suffix. A name of a
             built-in command, or one used twice, is a ValueError.
+        consumer_keys: Top-level keys of the config file that the consumer reads itself, such as
+            its accounts. The kit does not validate them, never reads them from the environment,
+            and ``config`` lists them by name only. ``help`` or ``servers`` is a ValueError.
+        config_layer: Computes a config layer from those keys; see ``ConfigLayer``.
     """
     _check_extra_commands(extra_commands)
+    check_consumer_keys(set(consumer_keys))
     app = App(
         bin_name,
         default_config,
@@ -685,6 +703,8 @@ def build_cli(
         retry_delays,
         tuple(extra_params),
         tuple(extra_commands),
+        frozenset(consumer_keys),
+        config_layer,
     )
     return KitGroup(app)
 
@@ -709,6 +729,8 @@ def main(
     result_classifier: ResultClassifier | None = None,
     extra_params: Sequence[click.Parameter] = (),
     extra_commands: Sequence[click.Command] = (),
+    consumer_keys: Iterable[str] = (),
+    config_layer: ConfigLayer | None = None,
     args: Sequence[str] | None = None,
 ) -> NoReturn:
     """Run a kit CLI; the entry point a consumer's console script calls. See ``build_cli`` for the arguments."""
@@ -719,6 +741,8 @@ def main(
         result_classifier=result_classifier,
         extra_params=extra_params,
         extra_commands=extra_commands,
+        consumer_keys=consumer_keys,
+        config_layer=config_layer,
     )
     run(cli, prog_name=bin_name, args=args)
 
@@ -799,12 +823,22 @@ def _runtime_owner(kit_ctx: click.Context) -> click.Context:
 
 
 def _load(kit_ctx: click.Context, group: KitGroup) -> LoadedConfig:
+    """Load the configuration of the kit group that runs in ``kit_ctx``, with the consumer's config layer."""
+    app = group.app
+    config_layer = app.config_layer
+
+    def layer(consumer: Mapping[str, Any]) -> Mapping[str, Any]:
+        assert config_layer is not None
+        return config_layer(kit_ctx, consumer)
+
     try:
         return load_config(
-            group.app.bin_name,
-            default=group.app.default_config,
+            app.bin_name,
+            default=app.default_config,
             config_path=kit_ctx.params.get("config"),
             command=kit_ctx.command_path,
+            consumer_keys=app.consumer_keys,
+            layer=layer if config_layer is not None else None,
         )
     except ConfigError as error:
         raise ConfigFailure(str(error)) from error

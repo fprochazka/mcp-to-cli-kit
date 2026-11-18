@@ -148,6 +148,59 @@ def main() -> None:
 
 The names of extra commands are reserved like `schema` and `config`: a tool whose command would take one gets a `-tool` suffix, and a group mount or top-level tool group with such a name is a config error. An extra command named like a built-in command is a `ValueError` when the CLI is built.
 
+### Settings of the consumer's own in the config file
+
+A consumer may keep settings of its own in the bin's config file, such as several accounts, and turn them into kit configuration on each run. `consumer_keys` names those top-level keys, and `config_layer` computes a config layer from them:
+
+```yaml
+default_org: work
+orgs:
+  work: {api_key: key-1, org_id: "1111"}
+  personal: {api_key: key-2}
+servers:
+  example:
+    timeout: 60
+```
+
+```python
+from collections.abc import Mapping
+from typing import Any
+
+import click
+from mcp_to_cli_kit.config import ConfigError
+
+
+def account_headers(ctx: click.Context, consumer: Mapping[str, Any]) -> Mapping[str, Any]:
+    orgs = consumer.get("orgs") or {}
+    name = ctx.params.get("org") or consumer.get("default_org")
+    if name is None:
+        return {}
+    if name not in orgs:
+        raise ConfigError(f"No account {name!r}. Accounts: {', '.join(sorted(orgs))}.")
+    headers = {"Authorization": f"Bearer {orgs[name]['api_key']}"}
+    if "org_id" in orgs[name]:
+        headers["X-Org-Id"] = orgs[name]["org_id"]
+    return {"servers": {"example": {"headers": headers}}}
+
+
+def main() -> None:
+    kit_main(
+        "example-tool",
+        DEFAULT_CONFIG,
+        distribution="example-tool",
+        extra_params=[ORG],
+        consumer_keys={"orgs", "default_org"},
+        config_layer=account_headers,
+    )
+```
+
+- The consumer keys are taken out of the file before the kit validates it, so they do not fail as unknown keys. They are read from the file only, never from the code default or the environment.
+- `config_layer` is called once per invocation, when a command first needs the configuration, with the bin's group context and the consumer keys the file holds (an empty mapping without a file). The context's `params` hold the global options, `extra_params` included.
+- Its result has the shape of the file. It is merged over the code default and under the file's own keys and the environment variables, so `servers.example.headers` in the file or `EXAMPLE_TOOL_SERVERS__EXAMPLE__HEADERS__AUTHORIZATION` still win. A header it leaves out is not sent.
+- Raising `ConfigError` ends the command with exit code 2 and its message.
+- `config` shows the merged result, with its header values masked as usual, and lists the consumer keys the file holds under `consumer_keys`, by name only, never their values.
+- `help` and `servers` cannot be consumer keys.
+
 ### Developing the kit and a consumer together
 
 To change the kit and a consumer at the same time, point the consumer at a local checkout of the kit as an editable path dependency, then install the consumer as a uv tool:
@@ -325,7 +378,7 @@ A property named like a built-in option (`help`, `input-json`, `arg-file`, `json
 
 ### The config command
 
-`example-tool config` prints the effective configuration as JSON: the code default, the config file and the environment variables merged, with every default filled in. Next to it, it shows the config file that was looked for (`config_file`), whether it was loaded (`config_file_loaded`), the environment variable prefix (`env_prefix`) and the names of the environment variables that were applied (`env_applied`), never their values.
+`example-tool config` prints the effective configuration as JSON: the code default, the config file and the environment variables merged, with every default filled in. Next to it, it shows the config file that was looked for (`config_file`), whether it was loaded (`config_file_loaded`), the environment variable prefix (`env_prefix`) and the names of the environment variables that were applied (`env_applied`), never their values, and for a bin with consumer keys, the names of those the file holds (`consumer_keys`).
 
 ```console
 $ example-tool config --pretty
