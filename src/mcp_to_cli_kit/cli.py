@@ -129,10 +129,19 @@ class App:
     result_classifier: ResultClassifier | None = None
     retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS
     extra_params: tuple[click.Parameter, ...] = ()
+    extra_commands: tuple[click.Command, ...] = ()
 
     @property
     def bin_version(self) -> str:
         return distribution_version(self.distribution, self.bin_name)
+
+    @property
+    def reserved_commands(self) -> frozenset[str]:
+        """The command names no tool may take: the kit's built-ins and the consumer's extra commands."""
+        return BUILTIN_COMMANDS | {command.name for command in self.extra_commands if command.name}
+
+    def extra_command(self, name: str) -> click.Command | None:
+        return next((command for command in self.extra_commands if command.name == name), None)
 
 
 @dataclass(frozen=True)
@@ -163,15 +172,16 @@ class ToolIndex:
     entries: dict[str, ToolEntry] = field(default_factory=dict)
     aliases: dict[str, str] = field(default_factory=dict)
     normalized_aliases: dict[str, str] = field(default_factory=dict)
+    reserved: frozenset[str] = BUILTIN_COMMANDS
 
     def add(self, server: str, local_name: str, tool: dict[str, Any], aliases: tuple[str, ...]) -> str | None:
         """Add a tool under the kebab case of ``local_name``; returns the command name, None when it is taken.
 
-        A tool whose command would be a built-in command (``schema`` or ``config``) gets a ``-tool``
-        suffix, at every level.
+        A tool whose command would be a reserved name (a built-in command such as ``schema`` or
+        ``config``, or a consumer's extra command) gets a ``-tool`` suffix, at every level.
         """
         command = kebab_case(local_name)
-        if command in BUILTIN_COMMANDS:
+        if command in self.reserved:
             command = f"{command}-tool"
         if command in self.entries:
             command = local_name
@@ -230,8 +240,9 @@ class ServerTools(ToolIndex):
         hidden: list[str],
         tool_groups: list[ToolGroup],
         strip_prefixes: Sequence[str] = (),
+        reserved: frozenset[str] = BUILTIN_COMMANDS,
     ) -> ServerTools:
-        index = cls(groups={group.group: ToolIndex() for group in tool_groups})
+        index = cls(groups={group.group: ToolIndex(reserved=reserved) for group in tool_groups}, reserved=reserved)
         by_prefix = sorted(tool_groups, key=lambda group: len(group.prefix), reverse=True)
         group_names = [group.group for group in tool_groups]
         for name, local, tool in _local_names(server, tools, hidden, strip_prefixes, group_names):
@@ -367,6 +378,15 @@ class Runtime:
                 login_command=self.login_command(name),
             )
 
+    def check_extra_commands(self) -> None:
+        """Fail when a group mount or a top-level tool group takes the name of one of the consumer's extra commands."""
+        for name in [*self.group_mounts(), *self.top_level_tool_groups()]:
+            if self.app.extra_command(name) is not None:
+                raise ConfigFailure(
+                    f"The group {name!r} has the name of a command of {self.command_path}. "
+                    "Give the group mount or tool group another name."
+                )
+
     def oauth_servers(self) -> list[str]:
         """The servers that sign in with OAuth, in config order."""
         return [name for name, server in self.config.servers.items() if server.auth is not None]
@@ -429,7 +449,9 @@ class Runtime:
 
     def _index(self, server: str, tools: list[dict[str, Any]]) -> ServerTools:
         config = self.config.servers[server]
-        index = ServerTools.build(server, tools, config.hidden_tools, config.tool_groups, config.strip_prefixes)
+        index = ServerTools.build(
+            server, tools, config.hidden_tools, config.tool_groups, config.strip_prefixes, self.app.reserved_commands
+        )
         if index.clashes:
             names = ", ".join(repr(name) for name in index.clashes)
             raise ConfigFailure(
@@ -635,6 +657,7 @@ def build_cli(
     result_classifier: ResultClassifier | None = None,
     retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS,
     extra_params: Sequence[click.Parameter] = (),
+    extra_commands: Sequence[click.Command] = (),
 ) -> click.Group:
     """Build the click group of a kit CLI.
 
@@ -648,9 +671,34 @@ def build_cli(
         extra_params: Options of the consumer's own, added to the bin's global options, such as
             an account selector. Make them eager to have their values in ``ctx.params`` before
             the tools are listed. A name or option string the kit already uses is a ValueError.
+        extra_commands: Commands of the consumer's own, listed and run at the top level next to the
+            built-ins and the tools. They run without loading the config or the tool lists. A tool
+            whose command would take one of their names gets a ``-tool`` suffix. A name of a
+            built-in command, or one used twice, is a ValueError.
     """
-    app = App(bin_name, default_config, distribution, result_classifier, retry_delays, tuple(extra_params))
+    _check_extra_commands(extra_commands)
+    app = App(
+        bin_name,
+        default_config,
+        distribution,
+        result_classifier,
+        retry_delays,
+        tuple(extra_params),
+        tuple(extra_commands),
+    )
     return KitGroup(app)
+
+
+def _check_extra_commands(commands: Sequence[click.Command]) -> None:
+    names: set[str] = set()
+    for command in commands:
+        if not command.name:
+            raise ValueError("An extra command needs a name.")
+        if command.name in BUILTIN_COMMANDS:
+            raise ValueError(f"The extra command {command.name!r} has the name of a built-in command.")
+        if command.name in names:
+            raise ValueError(f"There are two extra commands named {command.name!r}.")
+        names.add(command.name)
 
 
 def main(
@@ -660,6 +708,7 @@ def main(
     distribution: str | None = None,
     result_classifier: ResultClassifier | None = None,
     extra_params: Sequence[click.Parameter] = (),
+    extra_commands: Sequence[click.Command] = (),
     args: Sequence[str] | None = None,
 ) -> NoReturn:
     """Run a kit CLI; the entry point a consumer's console script calls. See ``build_cli`` for the arguments."""
@@ -669,6 +718,7 @@ def main(
         distribution=distribution,
         result_classifier=result_classifier,
         extra_params=extra_params,
+        extra_commands=extra_commands,
     )
     run(cli, prog_name=bin_name, args=args)
 
@@ -781,6 +831,7 @@ def _runtime(ctx: click.Context) -> Runtime:
         runtime.close()
 
     _runtime_owner(kit_ctx).call_on_close(close)
+    runtime.check_extra_commands()
     return runtime
 
 
@@ -912,7 +963,8 @@ class KitGroup(_CompletingGroup):
 
     def list_commands(self, ctx: click.Context) -> list[str]:
         listing = self._listing(ctx)
-        return sorted([*listing.tools, *listing.groups, *_top_level_builtins(_runtime(ctx))])
+        extras = [command.name for command in self.app.extra_commands if command.name]
+        return sorted([*listing.tools, *listing.groups, *_top_level_builtins(_runtime(ctx)), *extras])
 
     def _listing(self, ctx: click.Context) -> TopLevelListing:
         runtime = _runtime(ctx)
@@ -926,6 +978,9 @@ class KitGroup(_CompletingGroup):
         return listing
 
     def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        extra = self.app.extra_command(cmd_name)
+        if extra is not None:
+            return extra
         if cmd_name == SchemaCommand.NAME:
             return SchemaCommand()
         if cmd_name == ConfigCommand.NAME:
@@ -960,7 +1015,10 @@ class KitGroup(_CompletingGroup):
         if rows:
             with formatter.section("Tools"):
                 formatter.write_dl(rows)
-        _write_builtins(formatter, top_level=True, auth=bool(_runtime(ctx).oauth_servers()))
+        extras = [
+            (command.name, command.get_short_help_str(limit=formatter.width)) for command in self.app.extra_commands
+        ]
+        _write_builtins(formatter, top_level=True, auth=bool(_runtime(ctx).oauth_servers()), extra=extras)
         if listing.unavailable:
             with formatter.section("Unavailable servers"):
                 formatter.write_dl(sorted(listing.unavailable.items()))
@@ -1096,8 +1154,15 @@ def _top_level_builtins(runtime: Runtime) -> list[str]:
     return [name for name in BUILTIN_COMMANDS if name != AuthGroup.NAME or runtime.oauth_servers()]
 
 
-def _write_builtins(formatter: click.HelpFormatter, *, top_level: bool = False, auth: bool = False) -> None:
+def _write_builtins(
+    formatter: click.HelpFormatter,
+    *,
+    top_level: bool = False,
+    auth: bool = False,
+    extra: Sequence[tuple[str | None, str]] = (),
+) -> None:
     rows = [(SchemaCommand.NAME, SchemaCommand.HELP)]
+    rows += [(name, text) for name, text in extra if name is not None]
     if top_level:
         rows.append((ConfigCommand.NAME, ConfigCommand.HELP))
     if auth:

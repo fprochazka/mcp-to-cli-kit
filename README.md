@@ -119,7 +119,7 @@ def main() -> None:
 - Hints and usage lines name the path the user typed: `Run 'example mcp --help' for the list.`, `Run 'example mcp auth login' in a terminal`.
 - The bin name passed to `build_cli()` still names the config, cache and token directories, the environment variable prefix (`EXAMPLE_MCP_`), the `X-Mcp-Client` header and the MCP `clientInfo`, so the mounted group shares them with a standalone `example-mcp` script built from the same arguments.
 
-### Global options of the consumer's own
+### Global options and commands of the consumer's own
 
 `extra_params` adds click options to the bin's global options, next to `--config`, `-v` and `--json`. Make such an option eager (`is_eager=True`), so its value is in the group's `ctx.params` before the tools are listed or a tool is resolved. An option whose name or option string the kit already uses is a `ValueError` when the CLI is built.
 
@@ -132,6 +132,21 @@ ORG = click.Option(["-o", "--org", "org"], envvar="EXAMPLE_TOOL_ORG", is_eager=T
 def main() -> None:
     kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool", extra_params=[ORG])
 ```
+
+`extra_commands` adds click commands (or groups) to the top level, next to the tools. They are listed under "Commands" with `schema` and `config`, and run without loading the configuration or any tool list, so they work offline and with a broken config. They read the global options from their parent context (`ctx.parent.params["org"]`, `ctx.parent.params["config"]`); `mcp_to_cli_kit.config.resolve_config_path` and `save_config` find and write the config file the kit reads. A command should import its heavy dependencies inside its callback, so it starts fast.
+
+```python
+@click.command("whoami", help="Print the selected account.")
+@click.pass_context
+def whoami(ctx: click.Context) -> None:
+    click.echo(ctx.parent.params["org"])
+
+
+def main() -> None:
+    kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool", extra_params=[ORG], extra_commands=[whoami])
+```
+
+The names of extra commands are reserved like `schema` and `config`: a tool whose command would take one gets a `-tool` suffix, and a group mount or top-level tool group with such a name is a config error. An extra command named like a built-in command is a `ValueError` when the CLI is built.
 
 ### Developing the kit and a consumer together
 
