@@ -53,6 +53,8 @@ from mcp_to_cli_kit.config import (
     default_config_path,
     load_config,
 )
+from mcp_to_cli_kit.lazy import EXIT_INTERRUPTED as EXIT_INTERRUPTED
+from mcp_to_cli_kit.lazy import LazyKitGroup, _standalone, run
 from mcp_to_cli_kit.logs import configure_logging
 from mcp_to_cli_kit.oauth import AuthError, AuthTransportError, TokenStore, default_token_dir
 from mcp_to_cli_kit.output import OutputMode, finish, render, resolve_mode
@@ -73,7 +75,6 @@ EXIT_TOOL_ERROR = 1
 EXIT_USAGE = 2
 EXIT_TRANSPORT = 3
 EXIT_AUTH = 4
-EXIT_INTERRUPTED = 130
 
 _RUNTIME_KEY = "mcp_to_cli_kit.runtime"
 
@@ -656,8 +657,7 @@ def main(
 ) -> NoReturn:
     """Run a kit CLI; the entry point a consumer's console script calls."""
     cli = build_cli(bin_name, default_config, distribution=distribution, result_classifier=result_classifier)
-    cli.main(args=list(args) if args is not None else None, prog_name=bin_name)
-    raise SystemExit(0)  # pragma: no cover - click's standalone mode always exits
+    run(cli, prog_name=bin_name, args=args)
 
 
 def _verbosity_callback(ctx: click.Context, param: click.Parameter, value: int) -> int:
@@ -716,6 +716,11 @@ def _kit_context(ctx: click.Context) -> tuple[click.Context, KitGroup]:
     while current is not None:
         if isinstance(current.command, KitGroup):
             return current, current.command
+        if isinstance(current.command, LazyKitGroup):
+            # A context a host made for the stand-in itself, as click's to_info_dict() does.
+            real = current.command.real()
+            if isinstance(real, KitGroup):
+                return current, real
         current = current.parent
     raise RuntimeError(f"{ctx.command_path} does not run inside a kit group")
 
@@ -837,7 +842,7 @@ class KitGroup(_CompletingGroup):
         standalone_mode: bool = True,
         **extra: Any,
     ) -> Any:
-        """Click's standalone handling, except that Ctrl-C exits 130 instead of 1.
+        """Click's standalone handling, except that Ctrl-C exits 130 instead of 1; see ``lazy.run()``.
 
         Logging is set up here, not when the group is built, so building the CLI has no side
         effects on the process; the ``-v`` callback adjusts it afterwards.
@@ -845,20 +850,19 @@ class KitGroup(_CompletingGroup):
         configure_logging(0)
         if not standalone_mode:
             return super().main(args, prog_name, complete_var, standalone_mode=False, **extra)
-        try:
-            # Click itself still handles a closed pipe (EPIPE) in this mode.
-            result = super().main(args, prog_name, complete_var, standalone_mode=False, **extra)
-        except click.ClickException as error:
-            error.show()
-            sys.exit(error.exit_code)
-        except (click.Abort, KeyboardInterrupt) as error:
-            if isinstance(error.__cause__, EOFError):
-                # End of input at a prompt, which click treats as an abort with exit 1.
-                click.echo("Aborted!", err=True)
-                sys.exit(1)
-            click.echo("Interrupted.", err=True)
-            sys.exit(EXIT_INTERRUPTED)
-        sys.exit(result if isinstance(result, int) else 0)
+        _standalone(
+            self, lambda: super(KitGroup, self).main(args, prog_name, complete_var, standalone_mode=False, **extra)
+        )
+
+    def make_context(
+        self, info_name: str | None, args: list[str], parent: click.Context | None = None, **extra: Any
+    ) -> click.Context:
+        """Set up logging when the group is used under a host CLI too, where ``main()`` never runs.
+
+        The host's own commands keep the host's logging: only using this group changes it.
+        """
+        configure_logging(0)
+        return super().make_context(info_name, args, parent, **extra)
 
     def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
         """Close the context when parsing fails, so the runtime it may already hold is closed too.

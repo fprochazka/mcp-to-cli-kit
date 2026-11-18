@@ -79,12 +79,14 @@ def main() -> None:
 
 ### Mounting under a host CLI
 
-The group `build_cli()` returns can also be a subcommand of a larger click CLI, so that `example mcp search-items ...` calls the tools next to the host's own commands:
+The group `build_cli()` returns can also be a subcommand of a larger click CLI, so that `example mcp search-items ...` calls the tools next to the host's own commands. `mcp_to_cli_kit.lazy` has what the host needs, and imports only click:
 
 ```python
 import click
 
-from mcp_to_cli_kit.cli import build_cli
+from mcp_to_cli_kit.lazy import mount, run
+
+DEFAULT_CONFIG = {"servers": {"example": {"url": "https://mcp.example.com/mcp"}}}
 
 
 @click.group()
@@ -92,9 +94,27 @@ def example() -> None:
     """The example CLI."""
 
 
-example.add_command(build_cli("example-mcp", DEFAULT_CONFIG, distribution="example-tool"), name="mcp")
+@example.command()
+def hello() -> None:
+    """A command of the host itself."""
+
+
+def kit_cli() -> click.Group:
+    from mcp_to_cli_kit.cli import build_cli
+
+    return build_cli("example-mcp", DEFAULT_CONFIG, distribution="example-tool")
+
+
+mount(example, "mcp", "Call the tools of the example MCP server.", kit_cli)
+
+
+def main() -> None:
+    run(example, prog_name="example")
 ```
 
+- `mount(host, name, help, factory)` adds a `LazyKitGroup` to the host. Its help is static, so `example --help`, `example hello` and the completion of `example <TAB>` never call `factory()`. The factory runs once, when `example mcp ...` is used (to run a tool, show the help or complete a tool name), and the group it builds handles the rest. With `build_cli` imported inside the factory, as above, the MCP SDK, httpx, pydantic, jsonschema and PyYAML are not even imported before then, which saves about 0.2 s at every start of the host.
+- `run(group, *, prog_name, args=None)` runs a click CLI the way the kit's own `main()` does, which is click's standalone mode except for Ctrl-C: an error prints one `Error:` line and exits with its code, an abort (a declined `confirm(abort=True)`, end of input at a prompt) prints `Aborted!` and exits 1, and Ctrl-C prints `Interrupted.` and exits 130 (click exits 1). A command's return value is ignored; `ctx.exit(code)` sets the exit code. Use it for the host, so that the mounted tools fail the same way as in a standalone kit CLI. It leaves logging alone: the mounted group sets up the kit's logging to stderr (and `-v`) only when it is used, so the host's own commands keep the host's logging.
+- `LazyKitGroup(name, help, factory, *, short_help=None, hidden=False)` is the group `mount()` adds, for a host that registers its commands another way. `build_cli()`'s group also mounts directly with `host.add_command(build_cli(...), name="mcp")`, but then the kit is imported and built at every start.
 - The kit's global options belong to the mounted group: `example mcp --config other.yaml search-items`, not `example --config other.yaml mcp search-items`.
 - Hints and usage lines name the path the user typed: `Run 'example mcp --help' for the list.`, `Run 'example mcp auth login' in a terminal`.
 - The bin name passed to `build_cli()` still names the config, cache and token directories, the environment variable prefix (`EXAMPLE_MCP_`), the `X-Mcp-Client` header and the MCP `clientInfo`, so the mounted group shares them with a standalone `example-mcp` script built from the same arguments.
