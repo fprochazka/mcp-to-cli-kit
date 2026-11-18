@@ -20,6 +20,7 @@ from mcp_to_cli_kit.config import (
     default_config_path,
     env_prefix_for,
     load_config,
+    read_config_file,
     resolve_config_path,
     save_config,
 )
@@ -572,6 +573,43 @@ class TestModel:
         assert server.mount == "root"
         assert server.tool_groups == []
         assert server.hidden_tools == []
+
+
+class TestReadConfigFile:
+    def test_round_trip_with_save_config_keeps_every_key(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yaml"
+        data = {"default_org": "work", "orgs": {"work": {"api_key": "k"}}, "servers": {"alpha": {"timeout": 5}}}
+        save_config(path, data)
+
+        assert read_config_file(path) == data
+
+    @pytest.mark.parametrize("content", [None, "", "# only a comment\n"])
+    def test_a_missing_or_empty_file_is_an_empty_mapping(self, tmp_path: Path, content: str | None) -> None:
+        path = tmp_path / "config.yaml"
+        if content is not None:
+            path.write_text(content, encoding="utf-8")
+
+        assert read_config_file(path) == {}
+
+    @pytest.mark.parametrize(
+        ("content", "message"),
+        [("servers: [\n", "is not valid YAML"), ("- a\n- b\n", "must hold a mapping at the top level, got list")],
+    )
+    def test_a_broken_file_is_a_config_error(self, tmp_path: Path, content: str, message: str) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(content, encoding="utf-8")
+
+        with pytest.raises(ConfigError, match=message):
+            read_config_file(path)
+
+    def test_a_directory_is_a_config_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="Cannot read config file"):
+            read_config_file(tmp_path)
+
+    def test_the_home_directory_is_expanded(self, home: Path) -> None:
+        (home / "config.yaml").write_text("default_org: work\n", encoding="utf-8")
+
+        assert read_config_file("~/config.yaml") == {"default_org": "work"}
 
 
 class TestSaveConfig:

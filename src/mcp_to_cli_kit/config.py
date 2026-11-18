@@ -657,6 +657,26 @@ def load_config(
     )
 
 
+def read_config_file(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """Read a config file as written, without merging or validating it; the counterpart of ``save_config``.
+
+    For a consumer's commands that change its own keys of the file and write it back.
+
+    Args:
+        path: The file to read, such as ``resolve_config_path(bin_name, ctx.params["config"])``.
+
+    Returns:
+        The file's top-level mapping, or an empty mapping when the file does not exist or is empty.
+
+    Raises:
+        ConfigError: The file cannot be read, is not valid YAML, or does not hold a mapping.
+    """
+    target = Path(path).expanduser()
+    if not target.exists():
+        return {}
+    return _read_file(target)
+
+
 def save_config(path: str | os.PathLike[str], data: Mapping[str, Any] | CliConfig) -> Path:
     """Write a config file that may hold secrets, readable by its owner only.
 
