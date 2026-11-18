@@ -31,13 +31,10 @@ from mcp import types
 from mcp_to_cli_kit import config_view, oauth, redaction
 from mcp_to_cli_kit.arguments import CompiledTool, compile_tool, kebab_case
 from mcp_to_cli_kit.cache import CachedTools, SchemaCache, default_cache_dir
-from mcp_to_cli_kit.client import (
+from mcp_to_cli_kit.client import PortalProvider, ServerClient, ServerRejectedError, TransportError
+from mcp_to_cli_kit.client_defaults import (
     DEFAULT_RETRY_DELAYS,
     KIT_DISTRIBUTION,
-    PortalProvider,
-    ServerClient,
-    ServerRejectedError,
-    TransportError,
     client_header_value,
     distribution_version,
 )

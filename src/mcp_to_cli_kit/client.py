@@ -26,7 +26,6 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import timedelta
-from importlib import metadata
 from typing import Any, Literal, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -39,19 +38,18 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import McpError
 
 from mcp_to_cli_kit import redaction
+
+# Re-exported for code that imports them from here, where they used to live.
+from mcp_to_cli_kit.client_defaults import CLIENT_HEADER as CLIENT_HEADER
+from mcp_to_cli_kit.client_defaults import DEFAULT_RETRY_DELAYS as DEFAULT_RETRY_DELAYS
+from mcp_to_cli_kit.client_defaults import FALLBACK_VERSION as FALLBACK_VERSION
+from mcp_to_cli_kit.client_defaults import KIT_DISTRIBUTION as KIT_DISTRIBUTION
+from mcp_to_cli_kit.client_defaults import client_header_value as client_header_value
+from mcp_to_cli_kit.client_defaults import distribution_version as distribution_version
 from mcp_to_cli_kit.config import ResolvedServer, ServerConfig, expand_server, expand_url
 from mcp_to_cli_kit.oauth import AuthError, AuthTransportError, TokenManager, TokenStore
 
 logger = logging.getLogger(__name__)
-
-KIT_DISTRIBUTION = "mcp-to-cli-kit"
-
-FALLBACK_VERSION = "0.1.0"
-
-CLIENT_HEADER = "X-Mcp-Client"
-
-# Pauses before the first and second retry. Two retries at most.
-DEFAULT_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.5)
 
 RETRYABLE_STATUS = frozenset({502, 503, 504})
 
@@ -109,29 +107,6 @@ def redact_url(url: str) -> str:
         return urlunsplit((parts.scheme, host, parts.path, "", ""))
     except ValueError:
         return "<invalid URL>"
-
-
-def distribution_version(distribution: str | None, bin_name: str | None = None) -> str:
-    """The version of a distribution, found by name or through the console script ``bin_name``.
-
-    Returns:
-        The version, or ``0.1.0`` when the distribution cannot be found.
-    """
-    try:
-        if distribution is not None:
-            return metadata.version(distribution)
-        if bin_name is not None:
-            for entry_point in metadata.entry_points(group="console_scripts", name=bin_name):
-                if entry_point.dist is not None:
-                    return entry_point.dist.version
-    except metadata.PackageNotFoundError:
-        pass
-    return FALLBACK_VERSION
-
-
-def client_header_value(bin_name: str, bin_version: str) -> str:
-    """``<bin>/<version> (mcp-to-cli-kit <version>)``, the value of the audit header."""
-    return f"{bin_name}/{bin_version} ({KIT_DISTRIBUTION} {distribution_version(KIT_DISTRIBUTION)})"
 
 
 @dataclass
