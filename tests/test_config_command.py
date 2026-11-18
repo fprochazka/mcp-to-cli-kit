@@ -58,6 +58,44 @@ class TestOutput:
         assert data["config_file"] == str(path) and data["config_file_loaded"] is True
         assert data["config"]["servers"]["example"]["timeout"] == 5
 
+    def test_the_config_file_from_the_environment(self, invoke: Invoke, tmp_path: Path) -> None:
+        path = tmp_path / "from-env.yaml"
+        path.write_text(yaml.safe_dump({"servers": {"example": {"timeout": 7}}}), encoding="utf-8")
+
+        result = invoke(
+            ["config", "--json"], default={"servers": {"example": {"url": URL}}}, env={"EXAMPLE_TOOL_CONFIG": str(path)}
+        )
+
+        assert result.exit_code == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert data["config_file"] == str(path) and data["config_file_loaded"] is True
+        assert data["config"]["servers"]["example"]["timeout"] == 7
+        assert data["env_applied"] == []
+
+    def test_the_option_wins_over_the_environment(self, invoke: Invoke, tmp_path: Path) -> None:
+        option, variable = tmp_path / "option.yaml", tmp_path / "variable.yaml"
+        option.write_text(yaml.safe_dump({"servers": {"example": {"timeout": 1}}}), encoding="utf-8")
+        variable.write_text(yaml.safe_dump({"servers": {"example": {"timeout": 2}}}), encoding="utf-8")
+
+        result = invoke(
+            ["--config", str(option), "config", "--json"],
+            default={"servers": {"example": {"url": URL}}},
+            env={"EXAMPLE_TOOL_CONFIG": str(variable)},
+        )
+
+        assert result.exit_code == 0, result.stderr
+        assert json.loads(result.stdout)["config"]["servers"]["example"]["timeout"] == 1
+
+    def test_a_missing_file_from_the_environment_exits_2(self, invoke: Invoke, tmp_path: Path) -> None:
+        path = tmp_path / "missing.yaml"
+
+        result = invoke(
+            ["config"], default={"servers": {"example": {"url": URL}}}, env={"EXAMPLE_TOOL_CONFIG": str(path)}
+        )
+
+        assert result.exit_code == 2
+        assert f"Config file {path} does not exist." in result.stderr
+
     def test_env_variables_are_listed_by_name_only(self, invoke: Invoke) -> None:
         env = {
             "EXAMPLE_TOOL_HELP": "From env",

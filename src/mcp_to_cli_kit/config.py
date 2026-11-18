@@ -27,6 +27,7 @@ Environment variables::
     MY_TOOL_SERVERS__BETA__MOUNT__GROUP=b    one key of a mount, which replaces the whole mount
     MY_TOOL_SERVERS__ALPHA__AUTH__CLIENT_SECRET=...
                                              one key of the OAuth settings, merged with the rest
+    MY_TOOL_CONFIG=path/to/config.yaml       the config file, like --config, which wins over it
 
 The whole variable name, the prefix included, is matched case-insensitively, and a server
 name matches with ``-`` and ``_`` treated as the same character. Server names therefore
@@ -68,6 +69,9 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE_NAME = "config.yaml"
 
 ENV_NESTING = "__"
+
+# <PREFIX>CONFIG names the config file, like --config; it is no config key.
+CONFIG_PATH_KEY = "CONFIG"
 
 # Single separators only: "a__b" or "a-_b" would read as the "__" nesting in an env variable name.
 SERVER_NAME_PATTERN = r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$"
@@ -535,6 +539,11 @@ def env_prefix_for(bin_name: str) -> str:
     return _env_key(bin_name) + "_"
 
 
+def config_path_variable(bin_name: str) -> str:
+    """The environment variable that names the config file like ``--config`` does: ``MY_TOOL_CONFIG``."""
+    return env_prefix_for(bin_name) + CONFIG_PATH_KEY
+
+
 def load_config(
     bin_name: str,
     *,
@@ -723,6 +732,9 @@ def _read_env(
             continue
         value = environ[variable]
         parts = variable[len(prefix) :].upper().split(ENV_NESTING)
+
+        if parts == [CONFIG_PATH_KEY]:
+            continue  # the config file's path, read by --config
 
         if parts == ["HELP"]:
             layer["help"] = value

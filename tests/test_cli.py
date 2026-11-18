@@ -563,6 +563,20 @@ class TestConfigAndLogging:
 
         assert "Ignoring EXAMPLE_TOOL_COLOR" in result.stderr
 
+    def test_the_config_path_variable_is_not_an_ignored_key(self, invoke: Invoke, tmp_path: Path) -> None:
+        path = tmp_path / "empty.yaml"
+        path.write_text("", encoding="utf-8")
+
+        result = invoke(["-v", "no-args"], env={"EXAMPLE_TOOL_CONFIG": str(path)})
+
+        assert result.exit_code == 0, result.stderr
+        assert "Ignoring EXAMPLE_TOOL_CONFIG" not in result.stderr
+
+    def test_the_help_names_the_config_path_variable(self, invoke: Invoke) -> None:
+        result = invoke(["--help"])
+
+        assert "EXAMPLE_TOOL_CONFIG" in result.stdout
+
     def test_quiet_without_verbose(self, invoke: Invoke) -> None:
         result = invoke(["no-args"], env={"EXAMPLE_TOOL_COLOR": "red"})
 

@@ -50,6 +50,7 @@ from mcp_to_cli_kit.config import (
     PrefixMount,
     ResolvedServer,
     ToolGroup,
+    config_path_variable,
     default_config_path,
     load_config,
 )
@@ -806,6 +807,8 @@ class KitGroup(_CompletingGroup):
                 ["--config", "config"],
                 metavar="PATH",
                 is_eager=True,
+                envvar=config_path_variable(app.bin_name),
+                show_envvar=True,
                 help=f"Read this config file instead of {_home_relative(default_config_path(app.bin_name))}.",
             ),
             click.Option(

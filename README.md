@@ -149,7 +149,7 @@ $ example-tool search-items --query "red" --limit 5 --tags a --tags b --no-verbo
 
 ### Configuration
 
-The default from code is overridden by `~/.config/<bin>/config.yaml` (or the file given by `--config`), and that by environment variables with the bin's prefix, such as `EXAMPLE_TOOL_SERVERS__EXAMPLE__URL` or `EXAMPLE_TOOL_SERVERS__EXAMPLE__HEADERS__AUTHORIZATION`. Without a default and without a file, the CLI says which file it expected. See `mcp_to_cli_kit/config.py` for the full rules.
+The default from code is overridden by `~/.config/<bin>/config.yaml` (or the file given by `--config` or the `<PREFIX>CONFIG` environment variable, such as `EXAMPLE_TOOL_CONFIG`; the option wins), and that by environment variables with the bin's prefix, such as `EXAMPLE_TOOL_SERVERS__EXAMPLE__URL` or `EXAMPLE_TOOL_SERVERS__EXAMPLE__HEADERS__AUTHORIZATION`. Without a default and without a file, the CLI says which file it expected. See `mcp_to_cli_kit/config.py` for the full rules.
 
 ```yaml
 servers:
