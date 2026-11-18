@@ -359,6 +359,23 @@ uv run pytest
 
 CI runs the tests on Python 3.12 to 3.15.
 
+### Releasing
+
+The version comes from git tags through hatch-vcs; `pyproject.toml` holds none. A release is a `vX.Y.Z` tag on a `master` commit whose CI run is green:
+
+```bash
+git tag v0.5.0
+git push origin v0.5.0
+```
+
+The tag runs `.github/workflows/publish.yml`, which builds the sdist and the wheel with `uv build` and uploads them to PyPI through trusted publishing (the `pypi` environment, no token). Check that PyPI serves the new version:
+
+```bash
+curl -s https://pypi.org/pypi/mcp-to-cli-kit/json | jq -r .info.version
+```
+
+Follow semantic versioning: a new feature that keeps every existing consumer working is a minor release, a fix is a patch release. Consumers pin a minor range such as `mcp-to-cli-kit>=0.5.0,<0.6`.
+
 ### Commit hooks
 
 Configs, test fixtures and captured output can carry private identifiers such as internal server URLs, account names or paths. `scripts/hooks` holds a pre-commit and a commit-msg hook that refuse a commit when a staged line or the commit message matches a private identifier. The identifiers live in a file outside the repository, because listing them here would publish the very strings the hooks exist to keep out. Set it up once per clone:
