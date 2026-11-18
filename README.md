@@ -119,6 +119,20 @@ def main() -> None:
 - Hints and usage lines name the path the user typed: `Run 'example mcp --help' for the list.`, `Run 'example mcp auth login' in a terminal`.
 - The bin name passed to `build_cli()` still names the config, cache and token directories, the environment variable prefix (`EXAMPLE_MCP_`), the `X-Mcp-Client` header and the MCP `clientInfo`, so the mounted group shares them with a standalone `example-mcp` script built from the same arguments.
 
+### Global options of the consumer's own
+
+`extra_params` adds click options to the bin's global options, next to `--config`, `-v` and `--json`. Make such an option eager (`is_eager=True`), so its value is in the group's `ctx.params` before the tools are listed or a tool is resolved. An option whose name or option string the kit already uses is a `ValueError` when the CLI is built.
+
+```python
+import click
+
+ORG = click.Option(["-o", "--org", "org"], envvar="EXAMPLE_TOOL_ORG", is_eager=True, help="The account to use.")
+
+
+def main() -> None:
+    kit_main("example-tool", DEFAULT_CONFIG, distribution="example-tool", extra_params=[ORG])
+```
+
 ### Developing the kit and a consumer together
 
 To change the kit and a consumer at the same time, point the consumer at a local checkout of the kit as an editable path dependency, then install the consumer as a uv tool:

@@ -128,6 +128,7 @@ class App:
     distribution: str | None = None
     result_classifier: ResultClassifier | None = None
     retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS
+    extra_params: tuple[click.Parameter, ...] = ()
 
     @property
     def bin_version(self) -> str:
@@ -633,6 +634,7 @@ def build_cli(
     distribution: str | None = None,
     result_classifier: ResultClassifier | None = None,
     retry_delays: tuple[float, ...] = DEFAULT_RETRY_DELAYS,
+    extra_params: Sequence[click.Parameter] = (),
 ) -> click.Group:
     """Build the click group of a kit CLI.
 
@@ -643,8 +645,11 @@ def build_cli(
             the distribution that installed the ``bin_name`` console script is used.
         result_classifier: Reclassifies successful results as errors; see ``ResultClassifier``.
         retry_delays: The pauses before each retry of a request that failed in transit.
+        extra_params: Options of the consumer's own, added to the bin's global options, such as
+            an account selector. Make them eager to have their values in ``ctx.params`` before
+            the tools are listed. A name or option string the kit already uses is a ValueError.
     """
-    app = App(bin_name, default_config, distribution, result_classifier, retry_delays)
+    app = App(bin_name, default_config, distribution, result_classifier, retry_delays, tuple(extra_params))
     return KitGroup(app)
 
 
@@ -654,10 +659,17 @@ def main(
     *,
     distribution: str | None = None,
     result_classifier: ResultClassifier | None = None,
+    extra_params: Sequence[click.Parameter] = (),
     args: Sequence[str] | None = None,
 ) -> NoReturn:
-    """Run a kit CLI; the entry point a consumer's console script calls."""
-    cli = build_cli(bin_name, default_config, distribution=distribution, result_classifier=result_classifier)
+    """Run a kit CLI; the entry point a consumer's console script calls. See ``build_cli`` for the arguments."""
+    cli = build_cli(
+        bin_name,
+        default_config,
+        distribution=distribution,
+        result_classifier=result_classifier,
+        extra_params=extra_params,
+    )
     run(cli, prog_name=bin_name, args=args)
 
 
@@ -834,6 +846,8 @@ class KitGroup(_CompletingGroup):
                 help="Print the version and exit.",
             ),
         ]
+        _check_extra_params(params, app.extra_params)
+        params.extend(app.extra_params)
         super().__init__(name=app.bin_name, params=params, no_args_is_help=True)
         self.app = app
 
@@ -950,6 +964,20 @@ class KitGroup(_CompletingGroup):
         if listing.unavailable:
             with formatter.section("Unavailable servers"):
                 formatter.write_dl(sorted(listing.unavailable.items()))
+
+
+def _check_extra_params(own: Sequence[click.Parameter], extra: Sequence[click.Parameter]) -> None:
+    """Refuse consumer options that would take the name or an option string of a kit option, or of each other."""
+    names: set[str] = {"help", *(param.name for param in own if param.name)}
+    flags: set[str] = {"--help", *(flag for param in own for flag in [*param.opts, *param.secondary_opts])}
+    for param in extra:
+        taken = [flag for flag in [*param.opts, *param.secondary_opts] if flag in flags]
+        if param.name in names or taken:
+            what = ", ".join(taken) if taken else repr(param.name)
+            raise ValueError(f"The extra parameter {what} clashes with a global option of the kit or another extra.")
+        if param.name:
+            names.add(param.name)
+        flags.update([*param.opts, *param.secondary_opts])
 
 
 class MountGroup(_CompletingGroup):
