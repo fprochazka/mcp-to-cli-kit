@@ -1020,10 +1020,13 @@ class _CallbackListener:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - the name http.server calls
                 parts = urlsplit(self.path)
+                query = {name: values[0] for name, values in parse_qs(parts.query).items() if values}
+                # Before the response, whose log line shows the request with the code.
+                if query.get("code"):
+                    redaction.register_encoded(query["code"], "***")
                 if (parts.path or "/") != path:
                     self.send_error(404)
                     return
-                query = {name: values[0] for name, values in parse_qs(parts.query).items() if values}
                 if listener.result is None:
                     listener.result = query
                     listener._received.set()

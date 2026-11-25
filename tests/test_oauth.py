@@ -214,6 +214,14 @@ class TestLogin:
         assert result.exit_code == 2
         assert "No configured server signs in with OAuth" in result.stderr
 
+    def test_the_verbose_log_shows_no_code(self, run: Run, protected_server: ProtectedServer) -> None:
+        result = run(["-vv", "auth", "login"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "Sign-in listener: " in result.stderr and "/callback?" in result.stderr
+        assert protected_server.auth.issued_codes
+        assert_no_secrets(result, protected_server)
+
 
 class TestBearer:
     def test_every_request_carries_the_access_token(self, run: Run, protected_server: ProtectedServer) -> None:

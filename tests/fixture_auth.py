@@ -10,12 +10,15 @@ and redirects, as a user who clicks "Allow" would), ``/token`` and ``/revoke``. 
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
+import logging
 import secrets
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -296,13 +299,31 @@ def start() -> ProtectedServer:
     return ProtectedServer(f"{auth.origin}/mcp", auth.origin, recorder, auth, server, thread)
 
 
+@contextlib.contextmanager
+def _browser_unlogged() -> Iterator[None]:
+    """Keep the stand-in browser's requests out of the CLI's log, which would show the code.
+
+    A real browser is no part of the CLI. Only the HTTP client's loggers are quieted, so the CLI's
+    own log lines, such as the listener's, still show.
+    """
+    loggers = [logging.getLogger(name) for name in ("httpx", "httpcore")]
+    levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        for logger, level in zip(loggers, levels, strict=True):
+            logger.setLevel(level)
+
+
 def follow_sign_in(address: str) -> bool:
     """Stand in for the browser: follow the authorization server's redirect to the CLI's loopback listener."""
     import httpx
 
     parts = urlsplit(address)
     assert parts.scheme == "http", address
-    with httpx.Client(follow_redirects=True, timeout=10) as http:
+    with _browser_unlogged(), httpx.Client(follow_redirects=True, timeout=10) as http:
         response = http.get(address)
     assert response.status_code == 200, response.text
     return True
@@ -312,17 +333,10 @@ def sign_in_location(address: str) -> str:
     """Stand in for the browser of a sign-in with a pasted URL: the address the authorization server sends it to.
 
     The redirect is not followed: the redirect URI may be another application's, which the tests never contact.
-    A browser is no part of the CLI, so its requests stay out of the CLI's log, which would show the code.
     """
-    import logging
-
     import httpx
 
-    logging.disable(logging.CRITICAL)
-    try:
-        with httpx.Client(follow_redirects=False, timeout=10) as http:
-            response = http.get(address)
-    finally:
-        logging.disable(logging.NOTSET)
+    with _browser_unlogged(), httpx.Client(follow_redirects=False, timeout=10) as http:
+        response = http.get(address)
     assert response.status_code == 302, response.text
     return response.headers["location"]
