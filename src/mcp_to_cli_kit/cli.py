@@ -53,6 +53,7 @@ from mcp_to_cli_kit.config import (
     config_path_variable,
     default_config_path,
     expand_url,
+    is_loopback_redirect_uri,
     load_config,
 )
 from mcp_to_cli_kit.lazy import EXIT_INTERRUPTED as EXIT_INTERRUPTED
@@ -429,9 +430,15 @@ class Runtime:
         return [name for name, server in self.config.servers.items() if server.auth is not None]
 
     def login_command(self, server: str) -> str:
-        """The command that signs in to a server; it names the server only when the bin has several to sign in to."""
-        several = len([name for name, config in self.loaded.config.servers.items() if config.auth is not None]) > 1
-        return f"{self.command_path} auth login" + (f" {server}" if several else "")
+        """The command that signs in to a server; it names the server only when the bin has several to sign in to.
+
+        It adds ``--paste`` when the server's ``redirect_uri`` does not come back to this machine.
+        """
+        servers = self.loaded.config.servers
+        several = len([name for name, config in servers.items() if config.auth is not None]) > 1
+        auth = servers[server].auth if server in servers else None
+        paste = auth is not None and auth.redirect_uri is not None and not is_loopback_redirect_uri(auth.redirect_uri)
+        return f"{self.command_path} auth login" + (f" {server}" if several else "") + (" --paste" if paste else "")
 
     def close(self) -> None:
         for client in self.clients.values():
@@ -1274,7 +1281,9 @@ class AuthGroup(click.Group):
                 help=(
                     "Sign in to a server through the browser and store its tokens. Without SERVER, sign in to every "
                     "server that uses OAuth. The sign-in address is also printed, to open by hand. Commands refresh "
-                    "the tokens by themselves afterwards, until the authorization server ends the sign-in."
+                    "the tokens by themselves afterwards, until the authorization server ends the sign-in. With "
+                    "--paste, paste the URL the browser was sent to after the sign-in instead: for a client whose "
+                    "redirect URI is not on this machine (auth.redirect_uri), or a browser on another machine."
                 ),
                 params=[
                     server,
@@ -1288,7 +1297,15 @@ class AuthGroup(click.Group):
                         type=click.FloatRange(min=1),
                         default=DEFAULT_LOGIN_TIMEOUT_SECONDS,
                         show_default=True,
-                        help="Seconds to wait for the sign-in in the browser.",
+                        help="Seconds to wait for the browser to come back to this machine. Not used with --paste.",
+                    ),
+                    click.Option(
+                        ["--paste"],
+                        is_flag=True,
+                        help=(
+                            "Do not listen for the browser; read the URL it was sent to, or only its code, from "
+                            "stdin. Needs auth.redirect_uri or a non-zero auth.redirect_port."
+                        ),
                     ),
                 ],
             )
@@ -1358,25 +1375,56 @@ def _resolved(runtime: Runtime, name: str) -> ResolvedServer:
     return resolved
 
 
-def _login(server: str | None, no_browser: bool, timeout: float) -> None:
+def _login(server: str | None, no_browser: bool, timeout: float, paste: bool) -> None:
     from mcp_to_cli_kit import oauth
     from mcp_to_cli_kit.oauth import AuthError, AuthTransportError
 
     runtime, names = _oauth_targets(server)
+    # Every server is checked before the first sign-in, so a mistake does not show after a browser opened.
+    for name in names:
+        auth = runtime.config.servers[name].auth
+        assert auth is not None
+        _resolved(runtime, name)
+        if paste and oauth.paste_redirect_uri(auth) is None:
+            raise click.UsageError(
+                f"{name} has neither auth.redirect_uri nor a non-zero auth.redirect_port, so --paste has no redirect "
+                "URI to sign in with. Set the redirect URI the client is registered with in one of them."
+            )
+        if not paste and auth.redirect_uri is not None and not is_loopback_redirect_uri(auth.redirect_uri):
+            raise click.UsageError(
+                f"{name} has an https redirect_uri, so the sign-in cannot come back to this terminal. "
+                f"Run '{runtime.login_command(name)}'."
+            )
+
+    def echo(line: str) -> None:
+        click.echo(line, err=True)
+
     for name in names:
         resolved = _resolved(runtime, name)
         assert resolved.auth is not None
+        http_timeout = runtime.config.servers[name].timeout
         try:
-            tokens = oauth.login(
-                name,
-                resolved.url,
-                resolved.auth,
-                runtime.tokens,
-                echo=lambda line: click.echo(line, err=True),
-                browser=not no_browser,
-                wait_timeout=timeout,
-                http_timeout=runtime.config.servers[name].timeout,
-            )
+            if paste:
+                tokens = oauth.login_with_paste(
+                    name,
+                    resolved.url,
+                    resolved.auth,
+                    runtime.tokens,
+                    echo=echo,
+                    browser=not no_browser,
+                    http_timeout=http_timeout,
+                )
+            else:
+                tokens = oauth.login(
+                    name,
+                    resolved.url,
+                    resolved.auth,
+                    runtime.tokens,
+                    echo=echo,
+                    browser=not no_browser,
+                    wait_timeout=timeout,
+                    http_timeout=http_timeout,
+                )
         except AuthError as error:
             raise AuthFailure(f"signing in to {name} failed: {error}") from error
         except AuthTransportError as error:

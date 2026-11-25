@@ -2,13 +2,17 @@
 
 The tests run against ``fixture_auth``: an MCP server behind a bearer check and its authorization
 server, on a localhost port. The browser is replaced by a function that follows the authorization
-server's redirect to the CLI's real loopback listener.
+server's redirect to the CLI's real loopback listener. For ``auth login --paste`` it stops at the
+redirect instead, and the user who pastes the URL is a stdin that reads what that redirect said.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
+import socket
 import stat
 import threading
 import time
@@ -20,10 +24,11 @@ from typing import Any
 import pytest
 from click.testing import Result
 from conftest import BIN, Invoke
-from fixture_auth import CLIENT_ID, CLIENT_SECRET, EMAIL, ProtectedServer, follow_sign_in
+from fixture_auth import CLIENT_ID, CLIENT_SECRET, EMAIL, ProtectedServer, follow_sign_in, sign_in_location
+from pydantic import ValidationError
 
 from mcp_to_cli_kit import oauth
-from mcp_to_cli_kit.config import ServerConfig, expand_server
+from mcp_to_cli_kit.config import OAuthConfig, ServerConfig, expand_server
 from mcp_to_cli_kit.oauth import TokenManager, TokenStore, default_token_dir
 
 Run = Callable[..., Result]
@@ -51,8 +56,9 @@ def opened(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 def run(invoke: Invoke, protected_server: ProtectedServer, opened: list[str]) -> Run:
     """Run the CLI with one OAuth server, ``example``; keyword arguments change its auth settings."""
 
-    def run(args: list[str], env: dict[str, str] | None = None, **auth: Any) -> Result:
-        return invoke(args, default={"servers": {"example": server_config(protected_server, **auth)}}, env=env)
+    def run(args: list[str], env: dict[str, str] | None = None, input: Any = None, **auth: Any) -> Result:  # noqa: A002
+        default = {"servers": {"example": server_config(protected_server, **auth)}}
+        return invoke(args, default=default, env=env, input=input)
 
     return run
 
@@ -75,7 +81,7 @@ def expire() -> None:
 
 def secrets_of(server: ProtectedServer) -> list[str]:
     auth = server.auth
-    return [CLIENT_SECRET, *auth.access_tokens, *auth.id_tokens, *auth.refresh_tokens]
+    return [CLIENT_SECRET, *auth.access_tokens, *auth.id_tokens, *auth.refresh_tokens, *auth.issued_codes]
 
 
 def assert_no_secrets(result: Result, server: ProtectedServer) -> None:
@@ -207,6 +213,14 @@ class TestLogin:
 
         assert result.exit_code == 2
         assert "No configured server signs in with OAuth" in result.stderr
+
+    def test_the_verbose_log_shows_no_code(self, run: Run, protected_server: ProtectedServer) -> None:
+        result = run(["-vv", "auth", "login"])
+
+        assert result.exit_code == 0, result.stderr
+        assert "Sign-in listener: " in result.stderr and "/callback?" in result.stderr
+        assert protected_server.auth.issued_codes
+        assert_no_secrets(result, protected_server)
 
 
 class TestBearer:
@@ -594,7 +608,423 @@ class TestStatusAndLogout:
         assert "No server named 'other'" in result.stderr
 
 
+REDIRECT_URI = "https://app.example.net/oauth/callback"
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+        return port
+
+
+def has_ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+class Paster(io.RawIOBase):
+    """The user of ``auth login --paste``: signs in in the "browser" and pastes what ``edit`` makes of the callback URL.
+
+    It is the CLI's stdin. A line exists only once the browser was sent to the redirect URI, so the
+    stdin reads it lazily, one line per sign-in.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.locations: list[str] = []
+        self.edit: Callable[[str], str] = lambda location: location
+        self.interrupt = False
+        self._pending = b""
+
+    def browser(self, address: str) -> bool:
+        location = sign_in_location(address)
+        self.locations.append(location)
+        self._pending += (self.edit(location) + "\n").encode()
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if len(buffer) == 0:
+            return 0
+        if self.interrupt:
+            raise KeyboardInterrupt
+        size = min(len(buffer), len(self._pending))
+        buffer[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+
+@pytest.fixture
+def paster(monkeypatch: pytest.MonkeyPatch, opened: list[str]) -> Paster:
+    paster = Paster()
+    monkeypatch.setattr(oauth, "open_browser", paster.browser)
+    return paster
+
+
+def paste_login(run: Run, paster: Paster, *args: str, **auth: Any) -> Result:
+    auth.setdefault("redirect_uri", REDIRECT_URI)
+    return run(["auth", "login", "--paste", *args], input=paster, **auth)
+
+
+def code_of(location: str) -> str:
+    from urllib.parse import parse_qs, urlsplit
+
+    return parse_qs(urlsplit(location).query)["code"][0]
+
+
+class TestPasteLogin:
+    def test_signs_in_with_the_pasted_url(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 0, result.stderr
+        assert f"Signed in to example as {EMAIL}." in result.stderr
+        assert f"the browser goes to {REDIRECT_URI}" in result.stderr
+        assert "Paste the URL or the code for example:" in result.stderr
+        assert "state of the sign-in was not checked" not in result.stderr
+        assert_no_secrets(result, protected_server)
+        assert stat.S_IMODE(token_file().stat().st_mode) == 0o600
+        assert stored()["version"] == 1 and "redirect_uri" not in stored()
+
+    def test_the_grant_carries_the_configured_redirect_uri(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster
+    ) -> None:
+        assert paste_login(run, paster).exit_code == 0
+
+        auth = protected_server.auth
+        [authorize] = auth.authorize_requests
+        assert authorize["redirect_uri"] == REDIRECT_URI
+        assert authorize["client_id"] == CLIENT_ID
+        assert authorize["code_challenge_method"] == "S256" and authorize["code_challenge"] and authorize["state"]
+        assert authorize["scope"] == "openid" and authorize["resource"] == protected_server.origin
+        [token] = auth.token_requests
+        assert token["grant_type"] == "authorization_code"
+        assert token["code"] == code_of(paster.locations[0])
+        assert token["redirect_uri"] == REDIRECT_URI and token["code_verifier"]
+        assert token["client_id"] == CLIENT_ID and token["client_secret"] == CLIENT_SECRET
+        assert token["resource"] == protected_server.origin
+
+    def test_a_redirect_uri_with_a_query(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        redirect_uri = f"{REDIRECT_URI}?tenant=a"
+
+        result = paste_login(run, paster, redirect_uri=redirect_uri)
+
+        assert result.exit_code == 0, result.stderr
+        assert paster.locations[0].startswith(f"{redirect_uri}&code=")
+        assert protected_server.auth.token_requests[0]["redirect_uri"] == redirect_uri
+
+    def test_surrounding_whitespace_is_ignored(self, run: Run, paster: Paster) -> None:
+        paster.edit = lambda location: f"  \t{location}  "
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 0, result.stderr
+
+    def test_a_bare_code_signs_in_with_a_warning(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster
+    ) -> None:
+        paster.edit = code_of
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 0, result.stderr
+        assert "Only a code was pasted, so the state of the sign-in was not checked." in result.stderr
+        assert_no_secrets(result, protected_server)
+
+    @pytest.mark.parametrize("cut", ["https://", "https://app.example.net/oauth/callback?"])
+    def test_a_url_without_its_scheme_is_refused(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster, cut: str
+    ) -> None:
+        paster.edit = lambda location: location.removeprefix(cut)
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert "looks like a URL without its scheme; paste the whole URL, starting with https://" in result.stderr
+        assert protected_server.auth.token_requests == []
+        assert_no_secrets(result, protected_server)
+
+    @pytest.mark.parametrize(
+        "replaced",
+        ["/oauth/callback", "app.example.net", "https://"],
+        ids=["another path", "another host", "another scheme"],
+    )
+    def test_a_url_of_another_address_is_refused(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster, replaced: str
+    ) -> None:
+        other = {"/oauth/callback": "/oauth/other", "app.example.net": "evil.example.org", "https://": "http://"}
+        paster.edit = lambda location: location.replace(replaced, other[replaced])
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert f"the pasted URL is not the redirect URI {REDIRECT_URI}" in result.stderr
+        assert protected_server.auth.token_requests == []
+        assert_no_secrets(result, protected_server)
+
+    def test_another_state_is_refused(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        protected_server.auth.tamper_state = True
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert "the pasted URL belongs to another sign-in (the state differs)" in result.stderr
+        assert protected_server.auth.token_requests == []
+        assert_no_secrets(result, protected_server)
+
+    def test_a_denied_consent_fails(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        protected_server.auth.deny = "access_denied"
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert "the sign-in failed: access_denied" in result.stderr
+        assert not token_file().exists()
+
+    def test_a_url_without_a_code_is_refused(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        paster.edit = lambda location: location.replace("code=", "other=")
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert "the pasted URL carries no authorization code" in result.stderr
+        assert protected_server.auth.token_requests == []
+
+    def test_a_used_code_is_refused(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        assert paste_login(run, paster).exit_code == 0
+        first = code_of(paster.locations[0])
+        paster.edit = lambda location: first
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert "the token endpoint refused the code: invalid_grant (unknown code)" in result.stderr
+        assert "The code may have expired; run the command again and paste the URL at once" in result.stderr
+        assert_no_secrets(result, protected_server)
+
+    @pytest.mark.parametrize("pasted", ["", "   "], ids=["end of input", "blank line"])
+    def test_nothing_pasted(self, run: Run, protected_server: ProtectedServer, paster: Paster, pasted: str) -> None:
+        paster.edit = lambda location: pasted
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 4
+        assert "nothing was pasted; run the command again" in result.stderr
+        assert protected_server.auth.token_requests == []
+
+    def test_end_of_input_counts_as_nothing_pasted(self, run: Run, opened: list[str]) -> None:
+        result = run(["auth", "login", "--paste"], input="", redirect_uri=REDIRECT_URI)
+
+        assert result.exit_code == 4
+        assert "nothing was pasted; run the command again" in result.stderr
+
+    def test_ctrl_c_at_the_prompt_exits_130(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        paster.interrupt = True
+
+        result = paste_login(run, paster)
+
+        assert result.exit_code == 130
+        assert "Interrupted." in result.stderr
+        assert protected_server.auth.token_requests == []
+
+    def test_the_tokens_are_used_and_refreshed(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster
+    ) -> None:
+        assert paste_login(run, paster).exit_code == 0
+
+        first = run(["search-items", "--query", "x"], redirect_uri=REDIRECT_URI)
+        expire()
+        second = run(["search-items", "--query", "y"], redirect_uri=REDIRECT_URI)
+
+        assert first.exit_code == 0 and second.exit_code == 0, first.stderr + second.stderr
+        assert len(protected_server.auth.refresh_grants()) == 1
+        assert len(protected_server.auth.authorize_requests) == 1
+
+    def test_without_a_redirect_uri_a_fixed_port_is_used(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster
+    ) -> None:
+        port = free_port()
+
+        result = run(["auth", "login", "--paste"], input=paster, redirect_port=port)
+
+        assert result.exit_code == 0, result.stderr
+        assert protected_server.auth.token_requests[0]["redirect_uri"] == f"http://127.0.0.1:{port}/callback"
+
+    def test_without_a_redirect_uri_or_a_fixed_port_is_a_usage_error(
+        self, run: Run, protected_server: ProtectedServer, paster: Paster
+    ) -> None:
+        result = run(["auth", "login", "--paste"], input=paster)
+
+        assert result.exit_code == 2
+        assert "neither auth.redirect_uri nor a non-zero auth.redirect_port" in result.stderr
+        assert protected_server.auth.authorize_requests == []
+
+    def test_the_verbose_log_shows_no_secret(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        result = run(["-vv", "auth", "login", "--paste"], input=paster, redirect_uri=REDIRECT_URI)
+
+        assert result.exit_code == 0, result.stderr
+        assert "/token" in result.stderr
+        assert protected_server.auth.issued_codes
+        assert_no_secrets(result, protected_server)
+
+
+class TestRedirectUri:
+    def test_plain_login_with_an_https_redirect_uri_is_a_usage_error(
+        self, run: Run, protected_server: ProtectedServer, opened: list[str]
+    ) -> None:
+        result = run(["auth", "login"], redirect_uri=REDIRECT_URI)
+
+        assert result.exit_code == 2
+        assert "example has an https redirect_uri, so the sign-in cannot come back to this terminal" in result.stderr
+        assert f"Run '{BIN} auth login --paste'" in result.stderr
+        assert opened == [] and protected_server.auth.authorize_requests == []
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "[::1]"])
+    def test_plain_login_listens_on_a_loopback_redirect_uri(
+        self, run: Run, protected_server: ProtectedServer, host: str
+    ) -> None:
+        if host == "[::1]" and not has_ipv6_loopback():
+            pytest.skip("no IPv6 loopback")
+        redirect_uri = f"http://{host}:{free_port()}/oauth/done"
+
+        result = run(["auth", "login"], redirect_uri=redirect_uri)
+
+        assert result.exit_code == 0, result.stderr
+        assert protected_server.auth.authorize_requests[0]["redirect_uri"] == redirect_uri
+        assert protected_server.auth.token_requests[0]["redirect_uri"] == redirect_uri
+
+    def test_the_hint_names_paste(self, run: Run, protected_server: ProtectedServer) -> None:
+        result = run(["search-items", "--query", "x"], redirect_uri=REDIRECT_URI)
+
+        assert result.exit_code == 4
+        assert f"Run '{BIN} auth login --paste' in a terminal to sign in." in result.stderr
+
+    def test_the_hint_for_a_loopback_redirect_uri_has_no_paste(self, run: Run) -> None:
+        result = run(["search-items", "--query", "x"], redirect_uri="http://127.0.0.1:8123/callback")
+
+        assert result.exit_code == 4
+        assert f"Run '{BIN} auth login' in a terminal" in result.stderr
+
+    def test_the_environment_overrides_it(self, run: Run, protected_server: ProtectedServer, paster: Paster) -> None:
+        env = {"EXAMPLE_TOOL_SERVERS__EXAMPLE__AUTH__REDIRECT_URI": REDIRECT_URI}
+
+        result = run(["auth", "login", "--paste"], env=env, input=paster)
+
+        assert result.exit_code == 0, result.stderr
+        assert protected_server.auth.authorize_requests[0]["redirect_uri"] == REDIRECT_URI
+
+
+class TestSeveralServers:
+    def config(self, server: ProtectedServer, **second: Any) -> dict[str, Any]:
+        return {
+            "servers": {
+                "first": server_config(server, redirect_uri=REDIRECT_URI),
+                "second": server_config(server, **second),
+            }
+        }
+
+    def test_every_server_is_checked_before_the_first_sign_in(
+        self, invoke: Invoke, protected_server: ProtectedServer, opened: list[str]
+    ) -> None:
+        result = invoke(["auth", "login", "--paste"], default=self.config(protected_server))
+
+        assert result.exit_code == 2
+        assert "second has neither auth.redirect_uri" in result.stderr
+        assert opened == [] and protected_server.auth.authorize_requests == []
+
+    def test_plain_login_checks_every_server_first(
+        self, invoke: Invoke, protected_server: ProtectedServer, opened: list[str]
+    ) -> None:
+        default = self.config(protected_server)
+        default["servers"] = dict(reversed(default["servers"].items()))
+
+        result = invoke(["auth", "login"], default=default)
+
+        assert result.exit_code == 2
+        assert f"Run '{BIN} auth login first --paste'" in result.stderr
+        assert opened == [] and protected_server.auth.authorize_requests == []
+
+    def test_a_missing_variable_fails_before_the_first_sign_in(
+        self, invoke: Invoke, protected_server: ProtectedServer, opened: list[str]
+    ) -> None:
+        default = self.config(protected_server, client_secret="${EXAMPLE_MISSING_SECRET}")
+        default["servers"]["first"]["auth"].pop("redirect_uri")
+
+        result = invoke(["auth", "login"], default=default)
+
+        assert result.exit_code == 2
+        assert "EXAMPLE_MISSING_SECRET" in result.stderr
+        assert opened == [] and protected_server.auth.authorize_requests == []
+
+    def test_one_line_is_pasted_per_server(
+        self, invoke: Invoke, protected_server: ProtectedServer, paster: Paster
+    ) -> None:
+        default = self.config(protected_server, redirect_uri="https://other.example.net/cb")
+
+        result = invoke(["auth", "login", "--paste"], default=default, input=paster)
+
+        assert result.exit_code == 0, result.stderr
+        assert "Paste the URL or the code for first:" in result.stderr
+        assert "Paste the URL or the code for second:" in result.stderr
+        assert "Signed in to first" in result.stderr and "Signed in to second" in result.stderr
+        assert [request["redirect_uri"] for request in protected_server.auth.token_requests] == [
+            REDIRECT_URI,
+            "https://other.example.net/cb",
+        ]
+
+
 class TestConfig:
+    @pytest.mark.parametrize(
+        "redirect_uri",
+        [
+            REDIRECT_URI,
+            "https://app.example.net/cb?tenant=a",
+            "https://127.0.0.1/cb",
+            "http://127.0.0.1:8123/callback",
+            "http://[::1]:8123/callback",
+            "http://localhost:8123",
+        ],
+    )
+    def test_a_valid_redirect_uri(self, redirect_uri: str) -> None:
+        config = OAuthConfig.model_validate({"type": "oauth", "client_id": CLIENT_ID, "redirect_uri": redirect_uri})
+
+        assert config.redirect_uri == redirect_uri
+
+    @pytest.mark.parametrize(
+        ("redirect_uri", "error"),
+        [
+            (
+                "http://app.example.net/cb",
+                "must be an https:// URL, or an http:// URL of 127.0.0.1, [::1] or localhost",
+            ),
+            ("/oauth/callback", "without a scheme"),
+            ("app.example.net/cb", "without a scheme"),
+            ("https://app.example.net/cb#done", "must not have a fragment"),
+            ("http://127.0.0.1/callback", "needs an explicit port"),
+            ("http://localhost:0/callback", "needs an explicit port"),
+            ("ftp://app.example.net/cb", "must be an http:// or https:// URL"),
+        ],
+    )
+    def test_an_invalid_redirect_uri(self, redirect_uri: str, error: str) -> None:
+        with pytest.raises(ValidationError, match=re.escape(error)):
+            OAuthConfig.model_validate({"type": "oauth", "client_id": CLIENT_ID, "redirect_uri": redirect_uri})
+
+    def test_a_redirect_uri_beside_a_fixed_port_is_a_config_error(self, run: Run) -> None:
+        result = run(["config"], redirect_uri=REDIRECT_URI, redirect_port=8123)
+
+        assert result.exit_code == 2
+        assert "set redirect_port to 0 or remove redirect_uri" in result.stderr
+
+    def test_a_redirect_uri_needs_a_client_id(self) -> None:
+        with pytest.raises(ValidationError, match="client_id"):
+            OAuthConfig.model_validate({"type": "oauth", "redirect_uri": REDIRECT_URI})
+
     def test_the_client_secret_is_masked(self, run: Run) -> None:
         result = run(["config", "--json"])
 

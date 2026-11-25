@@ -159,6 +159,9 @@ class OAuthConfig(_StrictModel):
     authorization_server: str | None = None
     # 0 picks a free port; a client registered with an exact redirect URI needs a fixed one.
     redirect_port: Annotated[int, Field(ge=0, le=65535)] = 0
+    # The registered redirect URI, for a client without a loopback redirect: https with any host, or
+    # http with a loopback host and a port, which `auth login` then listens on. Not a template.
+    redirect_uri: str | None = None
     # The RFC 8707 resource parameter, which the MCP spec requires; off only for a server that rejects it.
     resource: bool = True
 
@@ -175,6 +178,22 @@ class OAuthConfig(_StrictModel):
         if value is not None:
             check_http_url(value)
         return value
+
+    @field_validator("redirect_uri")
+    @classmethod
+    def _redirect_uri_is_valid(cls, value: str | None) -> str | None:
+        if value is not None:
+            check_redirect_uri(value)
+        return value
+
+    @model_validator(mode="after")
+    def _one_redirect(self) -> OAuthConfig:
+        if self.redirect_uri is not None and self.redirect_port != 0:
+            raise ValueError(
+                "redirect_uri and a non-zero redirect_port both name the redirect; "
+                "set redirect_port to 0 or remove redirect_uri"
+            )
+        return self
 
 
 class ServerConfig(_StrictModel):
@@ -349,6 +368,33 @@ def check_http_url(url: str, *, show_scheme: bool = True) -> None:
         urlsplit(url).port  # noqa: B018 - reading it validates it
     except ValueError:
         raise ValueError("must be an http:// or https:// URL with a valid host and numeric port") from None
+
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def check_redirect_uri(uri: str) -> None:
+    """Raise ValueError unless the URI is a redirect URI OAuth 2.1 allows.
+
+    That is an absolute URL without a fragment, either https with any host, or http with a
+    loopback host (``127.0.0.1``, ``[::1]`` or ``localhost``) and an explicit port. A query is allowed.
+    """
+    check_http_url(uri)
+    parts = urlsplit(uri)
+    if "#" in uri:
+        raise ValueError("must not have a fragment")
+    if parts.scheme.lower() == "https":
+        return
+    if (parts.hostname or "").lower() not in LOOPBACK_HOSTS:
+        raise ValueError("must be an https:// URL, or an http:// URL of 127.0.0.1, [::1] or localhost")
+    if not parts.port:
+        raise ValueError("needs an explicit port when it is an http:// loopback URL; the sign-in listens on it")
+
+
+def is_loopback_redirect_uri(uri: str) -> bool:
+    """Whether a valid redirect URI comes back to this machine, where ``auth login`` can listen for it."""
+    parts = urlsplit(uri)
+    return parts.scheme.lower() == "http" and (parts.hostname or "").lower() in LOOPBACK_HOSTS
 
 
 def expand_server(name: str, server: ServerConfig, environ: Mapping[str, str] | None = None) -> ResolvedServer:
