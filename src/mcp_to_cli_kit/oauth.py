@@ -3,7 +3,9 @@
 The flow follows the MCP authorization spec with a pre-registered client: the server's protected
 resource metadata names the authorization server, whose metadata gives the endpoints; the user
 signs in through the browser with the authorization code grant, PKCE (S256) and a loopback
-redirect, and the RFC 8707 ``resource`` parameter goes with every grant.
+redirect, and the RFC 8707 ``resource`` parameter goes with every grant. A client registered with
+another application's https redirect signs in with ``login_with_paste`` instead: the user pastes
+the URL the browser was sent to, or only its code.
 
 Sign-in is an explicit command. Every other command only reads the stored tokens, refreshes
 them when less than ``REFRESH_MARGIN_SECONDS`` remain, and fails with ``AuthError`` when there
@@ -26,12 +28,14 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import getpass
 import hashlib
 import html
 import json
 import logging
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -46,7 +50,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 import httpx
 
 from mcp_to_cli_kit import redaction
-from mcp_to_cli_kit.config import ResolvedOAuth, xdg_directory
+from mcp_to_cli_kit.config import OAuthConfig, ResolvedOAuth, is_loopback_redirect_uri, xdg_directory
 from mcp_to_cli_kit.files import write_private
 
 if sys.platform != "win32":
@@ -90,9 +94,11 @@ class AuthTransportError(Exception):
 class _GrantError(AuthError):
     """The token endpoint answered with an OAuth error."""
 
-    def __init__(self, message: str, error: str) -> None:
+    def __init__(self, message: str, error: str, detail: str) -> None:
         super().__init__(message)
         self.error = error
+        # ``error (error_description)``, redacted, or the HTTP status
+        self.detail = detail
 
 
 def _open_with_webbrowser(url: str) -> bool:
@@ -358,8 +364,8 @@ class TokenManager:
         tokens = self.store.load(self.server)
         if tokens is None or not tokens.is_for(self.url, self.auth):
             raise AuthError(
-                f"not signed in to {self.server}. Run '{self.login_command}' in a terminal; it opens a browser to "
-                "sign in. An AI agent should ask the user to run it."
+                f"not signed in to {self.server}. Run '{self.login_command}' in a terminal to sign in. "
+                "An AI agent should ask the user to run it."
             )
         return tokens
 
@@ -407,6 +413,9 @@ def login(
 ) -> StoredTokens:
     """Sign in through the browser and store the tokens.
 
+    The browser comes back to ``http://127.0.0.1:<redirect_port>/callback``, or to the host, port
+    and path of a loopback ``redirect_uri``.
+
     Args:
         server: The server's name, for messages and the token file.
         url: The expanded server URL.
@@ -416,14 +425,30 @@ def login(
         wait_timeout: How long to wait for the browser to come back to the loopback address.
 
     Raises:
-        AuthError: Discovery found no usable authorization server, the user did not sign in, or
-            the authorization server refused the grant.
+        AuthError: Discovery found no usable authorization server, the user did not sign in, the
+            authorization server refused the grant, or ``redirect_uri`` is not a loopback address.
         AuthTransportError: A server could not be reached.
     """
+    config = auth.config
+    if config.redirect_uri is not None and not is_loopback_redirect_uri(config.redirect_uri):
+        raise AuthError(
+            f"{server} has an https redirect_uri, so the sign-in cannot come back to this terminal; "
+            "sign in with login_with_paste() instead"
+        )
     with httpx.Client(timeout=http_timeout) as http:
         found = discover(http, url, auth)
-        listener = _CallbackListener("127.0.0.1", auth.config.redirect_port, CALLBACK_PATH)
-        request = _authorization_request(found, auth, f"http://127.0.0.1:{listener.port}{CALLBACK_PATH}")
+        if config.redirect_uri is None:
+            listener = _CallbackListener("127.0.0.1", config.redirect_port, CALLBACK_PATH, "auth.redirect_port")
+            redirect_uri = f"http://127.0.0.1:{listener.port}{CALLBACK_PATH}"
+        else:
+            parts = urlsplit(config.redirect_uri)
+            host = (parts.hostname or "").lower()
+            assert parts.port is not None  # the config requires a port for a loopback redirect_uri
+            listener = _CallbackListener(
+                f"[{host}]" if ":" in host else host, parts.port, parts.path or "/", "auth.redirect_uri"
+            )
+            redirect_uri = config.redirect_uri
+        request = _authorization_request(found, auth, redirect_uri)
 
         echo(f"Sign in to {server} in the browser. If it does not open, open this address:\n{request.address}")
         if browser and not _try_open_browser(request.address):
@@ -440,6 +465,138 @@ def login(
             raise AuthError("the sign-in answer carries no authorization code; try again")
 
         return _exchange_code(http, server, url, auth, store, request, code)
+
+
+def paste_redirect_uri(config: OAuthConfig) -> str | None:
+    """The redirect URI of a sign-in with a pasted URL: ``redirect_uri``, else the loopback one of a fixed port.
+
+    None when neither is set: with port 0 no registration could know the port.
+    """
+    if config.redirect_uri is not None:
+        return config.redirect_uri
+    if config.redirect_port:
+        return f"http://127.0.0.1:{config.redirect_port}{CALLBACK_PATH}"
+    return None
+
+
+def login_with_paste(
+    server: str,
+    url: str,
+    auth: ResolvedOAuth,
+    store: TokenStore,
+    *,
+    echo: Callable[[str], None],
+    browser: bool = True,
+    http_timeout: float = 30.0,
+) -> StoredTokens:
+    """Sign in through the browser, read the URL it was sent to (or only the code) from stdin, and store the tokens.
+
+    For a client whose registered redirect URI is not on this machine, or a browser on another
+    machine. No listener is started. The pasted line is never echoed: on a terminal it is read
+    without echo, otherwise one line is read from stdin. There is no timeout.
+
+    Args:
+        server: The server's name, for messages and the token file.
+        url: The expanded server URL.
+        auth: The server's OAuth settings, expanded.
+        echo: Prints a line for the user, on stderr.
+        browser: Whether to open the sign-in address in a browser; it is printed either way.
+
+    Raises:
+        AuthError: Discovery found no usable authorization server, the pasted text is not a
+            callback of this sign-in, nothing was pasted, the authorization server refused the
+            grant, or the config sets neither ``redirect_uri`` nor a non-zero ``redirect_port``.
+        AuthTransportError: A server could not be reached.
+    """
+    redirect_uri = paste_redirect_uri(auth.config)
+    if redirect_uri is None:
+        raise AuthError(f"{server} has neither auth.redirect_uri nor a non-zero auth.redirect_port to sign in with")
+    with httpx.Client(timeout=http_timeout) as http:
+        found = discover(http, url, auth)
+        request = _authorization_request(found, auth, redirect_uri)
+
+        echo(f"Sign in to {server} in the browser. If it does not open, open this address:\n{request.address}")
+        if browser and not _try_open_browser(request.address):
+            echo("Could not open a browser; open the address above.")
+        echo(
+            f"After you sign in, the browser goes to {redirect_uri}. The page there may fail to load; that is fine. "
+            "Copy the whole URL from the address bar, or only the value of its code parameter, and paste it here. "
+            "If the page moves on at once, find the URL in the browser history."
+        )
+        line = _read_pasted(f"Paste the URL or the code for {server}: ", echo)
+        code = _pasted_code(line, request, echo)
+        try:
+            return _exchange_code(http, server, url, auth, store, request, code)
+        except _GrantError as error:
+            hint = (
+                ". The code may have expired; run the command again and paste the URL at once"
+                if error.error == "invalid_grant"
+                else ""
+            )
+            raise AuthError(f"the token endpoint refused the code: {error.detail}{hint}") from None
+
+
+def _read_pasted(prompt: str, echo: Callable[[str], None]) -> str:
+    """One line from the user, never echoed; empty at end of input. Ctrl-C raises KeyboardInterrupt."""
+    if sys.stdin.isatty():
+        try:
+            return getpass.getpass(prompt, stream=sys.stderr)
+        except EOFError:
+            return ""
+    echo(prompt.rstrip())
+    return sys.stdin.readline()
+
+
+def _pasted_code(line: str, request: _AuthorizationRequest, echo: Callable[[str], None]) -> str:
+    """The authorization code in a pasted callback URL, checked against this sign-in, or a pasted bare code.
+
+    The pasted text and the code are registered with ``redaction`` before anything else, and no
+    message repeats them.
+    """
+    text = line.strip()
+    if not text:
+        raise AuthError("nothing was pasted; run the command again")
+    redaction.register_encoded(text, "***")
+    if "://" not in text:
+        if "?" in text or "code=" in text:
+            raise AuthError(
+                "the pasted text looks like a URL without its scheme; paste the whole URL, starting with https://"
+            )
+        echo("Only a code was pasted, so the state of the sign-in was not checked.")
+        return text
+
+    if not _same_endpoint(text, request.redirect_uri):
+        raise AuthError(f"the pasted URL is not the redirect URI {request.redirect_uri}")
+    query = {name: values[0] for name, values in parse_qs(urlsplit(text).query).items() if values}
+    code = query.get("code")
+    if code:
+        redaction.register_encoded(code, "***")
+    if not secrets.compare_digest(query.get("state", ""), request.state):
+        raise AuthError(
+            "the pasted URL belongs to another sign-in (the state differs); "
+            "run the command again and paste the URL of this sign-in"
+        )
+    if "error" in query:
+        description = query.get("error_description")
+        raise AuthError(f"the sign-in failed: {query['error']}" + (f" ({description})" if description else ""))
+    if not code:
+        raise AuthError("the pasted URL carries no authorization code; copy the URL the sign-in redirected to")
+    return code
+
+
+def _same_endpoint(left: str, right: str) -> bool:
+    """Whether two URLs have the same scheme, host, port and path; the query does not count."""
+
+    def endpoint(url: str) -> tuple[str, str, int | None, str]:
+        parts = urlsplit(url)
+        scheme = parts.scheme.lower()
+        port = parts.port or {"http": 80, "https": 443}.get(scheme)
+        return scheme, (parts.hostname or "").lower(), port, parts.path or "/"
+
+    try:
+        return endpoint(left) == endpoint(right)
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -721,7 +878,8 @@ def _token_request(http: httpx.Client, endpoint: str, data: dict[str, str], auth
             f"HTTP {response.status_code} from the token endpoint {_display(endpoint)}", response.status_code
         )
     if response.status_code != 200:
-        raise _GrantError(f"the token endpoint refused the grant: {_oauth_error(response)}", _error_code(response))
+        detail = _oauth_error(response)
+        raise _GrantError(f"the token endpoint refused the grant: {detail}", _error_code(response), detail)
     try:
         payload = response.json()
     except ValueError:
@@ -850,7 +1008,11 @@ def _short(error: BaseException) -> str:
 class _CallbackListener:
     """Waits on a loopback port for the browser to come back from the authorization server."""
 
-    def __init__(self, host: str, port: int, path: str) -> None:
+    def __init__(self, host: str, port: int, path: str, setting: str) -> None:
+        """Listen on ``host`` as written in a URL (``127.0.0.1``, ``[::1]`` or ``localhost``, which binds 127.0.0.1).
+
+        ``setting`` is the config key to change when the port is taken.
+        """
         self.result: dict[str, str] | None = None
         self._received = threading.Event()
         listener = self
@@ -858,7 +1020,7 @@ class _CallbackListener:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - the name http.server calls
                 parts = urlsplit(self.path)
-                if parts.path != path:
+                if (parts.path or "/") != path:
                     self.send_error(404)
                     return
                 query = {name: values[0] for name, values in parse_qs(parts.query).items() if values}
@@ -881,11 +1043,14 @@ class _CallbackListener:
                 logger.debug("Sign-in listener: %s", redaction.redact(format % args))
 
         try:
-            self._server = HTTPServer((host, port), Handler)
+            if host == "[::1]":
+                self._server: HTTPServer = _IPv6HTTPServer(("::1", port), Handler)
+            else:
+                self._server = HTTPServer(("127.0.0.1" if host == "localhost" else host, port), Handler)
         except OSError as error:
             raise AuthError(
                 f"cannot listen on {host}:{port} for the sign-in: {error.strerror or error}. "
-                "Free the port, or change auth.redirect_port."
+                f"Free the port, or change {setting}."
             ) from None
         self.port = int(self._server.server_address[1])
         self._thread = threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
@@ -905,3 +1070,7 @@ class _CallbackListener:
         finally:
             self._server.shutdown()
             self._server.server_close()
+
+
+class _IPv6HTTPServer(HTTPServer):
+    address_family = socket.AF_INET6

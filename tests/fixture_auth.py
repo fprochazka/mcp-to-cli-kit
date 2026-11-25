@@ -72,6 +72,8 @@ class AuthorizationServer:
     bearers: list[str | None] = field(default_factory=list)
 
     codes: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Every code /authorize issued, also those already exchanged, for the secrets check
+    issued_codes: list[str] = field(default_factory=list)
     access_tokens: set[str] = field(default_factory=set)
     id_tokens: set[str] = field(default_factory=set)
     refresh_tokens: set[str] = field(default_factory=set)
@@ -168,8 +170,10 @@ class App:
         else:
             code = secrets.token_urlsafe(16)
             self.auth.codes[code] = query
+            self.auth.issued_codes.append(code)
             params = {"code": code, "state": state}
-        location = f"{query['redirect_uri']}?{urlencode(params)}"
+        redirect_uri = query["redirect_uri"]
+        location = f"{redirect_uri}{'&' if '?' in redirect_uri else '?'}{urlencode(params)}"
         await send({"type": "http.response.start", "status": 302, "headers": [(b"location", location.encode())]})
         await send({"type": "http.response.body", "body": b""})
 
@@ -302,3 +306,23 @@ def follow_sign_in(address: str) -> bool:
         response = http.get(address)
     assert response.status_code == 200, response.text
     return True
+
+
+def sign_in_location(address: str) -> str:
+    """Stand in for the browser of a sign-in with a pasted URL: the address the authorization server sends it to.
+
+    The redirect is not followed: the redirect URI may be another application's, which the tests never contact.
+    A browser is no part of the CLI, so its requests stay out of the CLI's log, which would show the code.
+    """
+    import logging
+
+    import httpx
+
+    logging.disable(logging.CRITICAL)
+    try:
+        with httpx.Client(follow_redirects=False, timeout=10) as http:
+            response = http.get(address)
+    finally:
+        logging.disable(logging.NOTSET)
+    assert response.status_code == 302, response.text
+    return response.headers["location"]
