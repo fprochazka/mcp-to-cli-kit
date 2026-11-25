@@ -422,33 +422,15 @@ def login(
     """
     with httpx.Client(timeout=http_timeout) as http:
         found = discover(http, url, auth)
-        verifier = secrets.token_urlsafe(64)
-        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=")
-        state = secrets.token_urlsafe(32)
+        listener = _CallbackListener("127.0.0.1", auth.config.redirect_port, CALLBACK_PATH)
+        request = _authorization_request(found, auth, f"http://127.0.0.1:{listener.port}{CALLBACK_PATH}")
 
-        listener = _CallbackListener(auth.config.redirect_port)
-        redirect_uri = f"http://127.0.0.1:{listener.port}{CALLBACK_PATH}"
-        params = {
-            "response_type": "code",
-            "client_id": auth.client_id,
-            "redirect_uri": redirect_uri,
-            "state": state,
-            "code_challenge": challenge.decode("ascii"),
-            "code_challenge_method": "S256",
-        }
-        if found.scopes:
-            params["scope"] = " ".join(found.scopes)
-        if auth.config.resource:
-            params["resource"] = found.resource
-        separator = "&" if "?" in found.authorization_endpoint else "?"
-        address = found.authorization_endpoint + separator + urlencode(params)
-
-        echo(f"Sign in to {server} in the browser. If it does not open, open this address:\n{address}")
-        if browser and not _try_open_browser(address):
+        echo(f"Sign in to {server} in the browser. If it does not open, open this address:\n{request.address}")
+        if browser and not _try_open_browser(request.address):
             echo("Could not open a browser; open the address above.")
         result = listener.wait(wait_timeout)
 
-        if not secrets.compare_digest(result.get("state", ""), state):
+        if not secrets.compare_digest(result.get("state", ""), request.state):
             raise AuthError("the sign-in answer does not belong to this sign-in (the state differs); try again")
         if "error" in result:
             description = result.get("error_description")
@@ -457,15 +439,70 @@ def login(
         if not code:
             raise AuthError("the sign-in answer carries no authorization code; try again")
 
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "code_verifier": verifier,
-        }
-        if auth.config.resource:
-            data["resource"] = found.resource
-        payload = _token_request(http, found.token_endpoint, data, auth)
+        return _exchange_code(http, server, url, auth, store, request, code)
+
+
+@dataclass(frozen=True)
+class _AuthorizationRequest:
+    """What one sign-in sends the browser to, and what it needs to exchange the code it gets back."""
+
+    found: AuthorizationServer
+    verifier: str
+    state: str
+    redirect_uri: str
+    address: str
+
+
+def _authorization_request(found: AuthorizationServer, auth: ResolvedOAuth, redirect_uri: str) -> _AuthorizationRequest:
+    """Build the authorization address for a discovered authorization server, with a fresh PKCE verifier and state."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=")
+    state = secrets.token_urlsafe(32)
+
+    params = {
+        "response_type": "code",
+        "client_id": auth.client_id,
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": challenge.decode("ascii"),
+        "code_challenge_method": "S256",
+    }
+    if found.scopes:
+        params["scope"] = " ".join(found.scopes)
+    if auth.config.resource:
+        params["resource"] = found.resource
+    separator = "&" if "?" in found.authorization_endpoint else "?"
+    address = found.authorization_endpoint + separator + urlencode(params)
+    return _AuthorizationRequest(
+        found=found, verifier=verifier, state=state, redirect_uri=redirect_uri, address=address
+    )
+
+
+def _exchange_code(
+    http: httpx.Client,
+    server: str,
+    url: str,
+    auth: ResolvedOAuth,
+    store: TokenStore,
+    request: _AuthorizationRequest,
+    code: str,
+) -> StoredTokens:
+    """Exchange the authorization code for tokens and store them.
+
+    Raises:
+        AuthError: The authorization server refused the grant.
+        AuthTransportError: It could not be reached.
+    """
+    found = request.found
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": request.redirect_uri,
+        "code_verifier": request.verifier,
+    }
+    if auth.config.resource:
+        data["resource"] = found.resource
+    payload = _token_request(http, found.token_endpoint, data, auth)
 
     base = StoredTokens(
         server_url_sha256=url_hash(url),
@@ -813,7 +850,7 @@ def _short(error: BaseException) -> str:
 class _CallbackListener:
     """Waits on a loopback port for the browser to come back from the authorization server."""
 
-    def __init__(self, port: int) -> None:
+    def __init__(self, host: str, port: int, path: str) -> None:
         self.result: dict[str, str] | None = None
         self._received = threading.Event()
         listener = self
@@ -821,7 +858,7 @@ class _CallbackListener:
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802 - the name http.server calls
                 parts = urlsplit(self.path)
-                if parts.path != CALLBACK_PATH:
+                if parts.path != path:
                     self.send_error(404)
                     return
                 query = {name: values[0] for name, values in parse_qs(parts.query).items() if values}
@@ -844,10 +881,10 @@ class _CallbackListener:
                 logger.debug("Sign-in listener: %s", redaction.redact(format % args))
 
         try:
-            self._server = HTTPServer(("127.0.0.1", port), Handler)
+            self._server = HTTPServer((host, port), Handler)
         except OSError as error:
             raise AuthError(
-                f"cannot listen on 127.0.0.1:{port} for the sign-in: {error.strerror or error}. "
+                f"cannot listen on {host}:{port} for the sign-in: {error.strerror or error}. "
                 "Free the port, or change auth.redirect_port."
             ) from None
         self.port = int(self._server.server_address[1])
